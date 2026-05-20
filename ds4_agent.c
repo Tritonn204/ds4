@@ -590,13 +590,13 @@ static const char agent_tools_prompt_edit_crc[] =
     "<｜DSML｜parameter name=\"new\" string=\"true\">if (count > limit) {\n    return limit;\n}</｜DSML｜parameter>\n"
     "</｜DSML｜invoke>\n"
     "</｜DSML｜tool_calls>\n"
-    "After a successful edit, the tool result reports new_file_cas_crc. Use that value for the next line/range edit "
+    "After a successful write or edit, the tool result reports new_file_cas_crc. Use that value for the next line/range edit "
     "on the same file instead of re-reading only to refresh the checksum.\n"
     "Use read raw=true only when you need undecorated file text.\n\n";
 
 static const char agent_tools_prompt_after_edit[] =
-    "For long-running bash commands, pass refresh_sec to receive updates. If a bash job is still running, use "
-    "bash_wait, bash_status, or bash_stop with the returned job number.\n\n"
+    "For long-running bash commands, pass refresh_sec. If a bash job is still running, use "
+    "bash_status to check it early or bash_stop to terminate it.\n\n"
     "### Available Tool Schemas\n\n"
     "{\"type\":\"function\",\"function\":{\"name\":\"bash\",\"description\":\"Run a shell command.\","
     "\"parameters\":{\"type\":\"object\",\"properties\":{\"command\":{\"type\":\"string\"},"
@@ -605,9 +605,6 @@ static const char agent_tools_prompt_after_edit[] =
     "{\"type\":\"function\",\"function\":{\"name\":\"bash_status\",\"description\":\"Report current status and new output for a bash job.\","
     "\"parameters\":{\"type\":\"object\",\"properties\":{\"job\":{\"type\":\"number\"},"
     "\"pid\":{\"type\":\"number\"}},\"required\":[\"job\"]}}}\n"
-    "{\"type\":\"function\",\"function\":{\"name\":\"bash_wait\",\"description\":\"Wait for a bash job to finish or produce another refresh.\","
-    "\"parameters\":{\"type\":\"object\",\"properties\":{\"job\":{\"type\":\"number\"},"
-    "\"pid\":{\"type\":\"number\"},\"refresh_sec\":{\"type\":\"number\"}},\"required\":[\"job\"]}}}\n"
     "{\"type\":\"function\",\"function\":{\"name\":\"bash_stop\",\"description\":\"Terminate a running bash job and report its final output.\","
     "\"parameters\":{\"type\":\"object\",\"properties\":{\"job\":{\"type\":\"number\"},"
     "\"pid\":{\"type\":\"number\"}},\"required\":[\"job\"]}}}\n"
@@ -2330,6 +2327,17 @@ static void agent_worker_build_system_tokens(agent_worker *w, ds4_tokens *out) {
                                w->cfg->edit_mode);
 }
 
+static void agent_publish_system_status(agent_worker *w, const char *msg) {
+    if (isatty(STDOUT_FILENO)) {
+        agent_publish(w, "\x1b[1;33m", strlen("\x1b[1;33m"));
+        agent_publish(w, msg, strlen(msg));
+        agent_publish(w, "\x1b[0m\n", strlen("\x1b[0m\n"));
+    } else {
+        agent_publish(w, msg, strlen(msg));
+        agent_publish(w, "\n", 1);
+    }
+}
+
 /* Synchronize the live DS4 session to a transcript.  This is the agent's main
  * cache-saving operation: if the requested transcript extends the live session,
  * only the suffix is prefetched; otherwise the DS4 session rebuilds from the
@@ -2390,6 +2398,8 @@ static bool agent_worker_reset_to_sysprompt(agent_worker *w, char *err, size_t e
     }
 
     if (!loaded) {
+        if (w->sysprompt_path)
+            agent_publish_system_status(w, "Updating system prompt cache...");
         ds4_tokens_free(&w->transcript);
         ds4_tokens_copy(&w->transcript, &sys);
         if (agent_worker_sync_tokens(w, &w->transcript, true, err, err_len) != 0) {
@@ -3175,6 +3185,59 @@ static void agent_split_lines(const char *data, size_t len, agent_line_spans *sp
     }
 }
 
+#define AGENT_EDIT_PREVIEW_MAX_LINES 8
+#define AGENT_EDIT_PREVIEW_MAX_BYTES 1600
+
+/* Add a small before/after preview to range-edit tool results.  The edit tool
+ * already applies exactly the requested line numbers; this preview makes a bad
+ * range choice obvious to the model on the very next turn. */
+static void agent_edit_preview_text(agent_buf *b, const char *label,
+                                    const char *text, size_t len,
+                                    int first_line) {
+    agent_buf_puts(b, label);
+    agent_buf_puts(b, ":\n");
+    if (len == 0) {
+        agent_buf_puts(b, "(empty)\n");
+        return;
+    }
+
+    size_t pos = 0, bytes = 0;
+    int shown = 0;
+    while (pos < len && shown < AGENT_EDIT_PREVIEW_MAX_LINES &&
+           bytes < AGENT_EDIT_PREVIEW_MAX_BYTES)
+    {
+        size_t start = pos;
+        while (pos < len && text[pos] != '\n' && text[pos] != '\r') pos++;
+        size_t content_end = pos;
+        if (pos < len) {
+            if (text[pos] == '\r' && pos + 1 < len && text[pos + 1] == '\n')
+                pos += 2;
+            else
+                pos++;
+        }
+
+        char prefix[64];
+        snprintf(prefix, sizeof(prefix), "%d ", first_line + shown);
+        agent_buf_puts(b, prefix);
+        size_t n = content_end - start;
+        if (bytes + n > AGENT_EDIT_PREVIEW_MAX_BYTES)
+            n = AGENT_EDIT_PREVIEW_MAX_BYTES - bytes;
+        agent_buf_append(b, text + start, n);
+        agent_buf_puts(b, "\n");
+        bytes += n;
+        shown++;
+    }
+    if (pos < len) agent_buf_puts(b, "... preview truncated ...\n");
+}
+
+static void agent_edit_preview_range(agent_buf *b,
+                                     const char *old_text, size_t old_len,
+                                     const char *new_text, int first_line) {
+    agent_edit_preview_text(b, "replaced_old_lines", old_text, old_len, first_line);
+    agent_edit_preview_text(b, "replacement_new_lines", new_text ? new_text : "",
+                            new_text ? strlen(new_text) : 0, first_line);
+}
+
 static int agent_read_file_bytes(const char *path, char **data, size_t *len,
                                  char *err, size_t errlen) {
     FILE *fp = fopen(path, "rb");
@@ -3452,8 +3515,11 @@ static char *agent_tool_write(const agent_tool_call *call) {
         agent_buf_puts(&b, "\n");
         return agent_buf_take(&b);
     }
-    char msg[PATH_MAX + 128];
-    snprintf(msg, sizeof(msg), "Wrote %zu bytes to %s\n", len, path);
+    char file_cas_crc[9];
+    agent_file_cas_crc(content, len, file_cas_crc);
+    char msg[PATH_MAX + 160];
+    snprintf(msg, sizeof(msg), "Wrote %zu bytes to %s; new_file_cas_crc=%s\n",
+             len, path, file_cas_crc);
     return xstrdup(msg);
 }
 
@@ -4023,20 +4089,27 @@ static char *agent_tool_edit_crc_range(const char *path, const char *file_cas_cr
     int rc = agent_write_file_bytes(path, out, out_len, err, sizeof(err));
     char new_file_cas_crc[9];
     agent_file_cas_crc(out, out_len, new_file_cas_crc);
-    agent_line_spans_free(&spans);
-    free(data);
-    free(out);
     if (rc != 0) {
         agent_buf b = {0};
         agent_buf_puts(&b, "Tool error: ");
         agent_buf_puts(&b, err);
         agent_buf_puts(&b, "\n");
+        agent_line_spans_free(&spans);
+        free(data);
+        free(out);
         return agent_buf_take(&b);
     }
+    agent_buf result = {0};
     char msg[PATH_MAX + 160];
     snprintf(msg, sizeof(msg), "Edited %s lines %d-%d; new_file_cas_crc=%s\n",
              path, start_line, end_line, new_file_cas_crc);
-    return xstrdup(msg);
+    agent_buf_puts(&result, msg);
+    agent_edit_preview_range(&result, data + s.start, e.end - s.start,
+                             new_text, start_line);
+    agent_line_spans_free(&spans);
+    free(data);
+    free(out);
+    return agent_buf_take(&result);
 }
 
 /* Pick the safest edit mode supported by the tool arguments.  The preferred
@@ -4588,36 +4661,27 @@ static char *agent_bash_observation(agent_bash_job *job, bool mark_observed) {
     agent_bash_poll(job);
     bool first_observation = !job->observed_once;
     int display_lines = agent_bash_display_lines(job);
-    size_t new_bytes = job->bytes >= job->observed_bytes ?
-                       job->bytes - job->observed_bytes : 0;
-    int new_lines = display_lines >= job->observed_display_lines ?
-                    display_lines - job->observed_display_lines : 0;
     double elapsed = now_sec() - job->start_time;
 
     agent_buf out = {0};
     char line[512];
-    snprintf(line, sizeof(line),
-        "bash %s job=%d pid=%ld status=%s elapsed_sec=%.1f timeout_sec=%.0f%s\n",
-        first_observation ? "initial" : (job->running ? "update" : "final"),
-        job->id, (long)job->pid, job->running ? "running" : "done",
-        elapsed, job->timeout_sec,
-        job->timed_out ? " timed_out=true" : "");
+    if (job->running) {
+        snprintf(line, sizeof(line),
+            "bash job=%d pid=%ld status=running elapsed_sec=%.1f timeout_sec=%.0f\n",
+            job->id, (long)job->pid, elapsed, job->timeout_sec);
+    } else {
+        snprintf(line, sizeof(line),
+            "bash job=%d pid=%ld status=done elapsed_sec=%.1f timed_out=%d\n",
+            job->id, (long)job->pid, elapsed, job->timed_out ? 1 : 0);
+    }
     agent_buf_puts(&out, line);
     if (!job->running) {
         snprintf(line, sizeof(line), "exit_status=%d\n", job->exit_status);
         agent_buf_puts(&out, line);
     }
-    snprintf(line, sizeof(line),
-        "output_path=%s\ntotal_bytes=%zu total_lines=%d\n"
-        "new_bytes_since_last_update=%zu new_lines_since_last_update=%d\n",
-        job->path[0] ? job->path : "<unavailable>",
-        job->bytes, display_lines, new_bytes, new_lines);
-    agent_buf_puts(&out, line);
 
     if (job->bytes == 0) {
-        agent_buf_puts(&out, first_observation ?
-                       "output: <no output yet>\n" :
-                       "no new output since previous update\n");
+        agent_buf_puts(&out, "<output>\n</output>\n");
     } else if (first_observation) {
         int shown_lines = 0;
         bool byte_limited = false;
@@ -4625,44 +4689,46 @@ static char *agent_bash_observation(agent_bash_job *job, bool mark_observed) {
                                           AGENT_BASH_HEAD_BYTES,
                                           &shown_lines, &byte_limited);
         bool truncated = byte_limited || display_lines > shown_lines;
-        if (truncated) {
-            snprintf(line, sizeof(line),
-                     "head -%d %s (initial output; truncated, full output at output_path):\n",
-                     AGENT_BASH_HEAD_LINES, job->path);
+        if (!job->running && !truncated) {
+            agent_buf_puts(&out, "<output>\n");
+            agent_buf_puts(&out, head);
+            if (head[0] && head[strlen(head) - 1] != '\n') agent_buf_puts(&out, "\n");
+            agent_buf_puts(&out, "</output>\n");
         } else {
-            snprintf(line, sizeof(line), "output (complete):\n");
-        }
-        agent_buf_puts(&out, line);
-        agent_buf_puts(&out, head);
-        if (head[0] && head[strlen(head) - 1] != '\n') agent_buf_puts(&out, "\n");
-        free(head);
-    } else if (job->running) {
-        if (new_bytes) {
-            char *tail = agent_bash_read_tail_lines(job, AGENT_BASH_PROGRESS_TAIL_LINES);
             snprintf(line, sizeof(line),
-                     "tail -%d %s (last lines of full output, not complete output):\n",
-                     AGENT_BASH_PROGRESS_TAIL_LINES, job->path);
+                     "output_path=%s (%zu bytes, %d lines)\n",
+                     job->path[0] ? job->path : "<unavailable>",
+                     job->bytes, display_lines);
             agent_buf_puts(&out, line);
-            agent_buf_puts(&out, tail);
-            if (tail[0] && tail[strlen(tail) - 1] != '\n') agent_buf_puts(&out, "\n");
-            free(tail);
-        } else {
-            agent_buf_puts(&out, "no new output since previous update\n");
+            snprintf(line, sizeof(line), "<head -%d %s>\n",
+                     AGENT_BASH_HEAD_LINES, job->path);
+            agent_buf_puts(&out, line);
+            agent_buf_puts(&out, head);
+            if (head[0] && head[strlen(head) - 1] != '\n') agent_buf_puts(&out, "\n");
+            agent_buf_puts(&out, "</head>\n");
         }
+        free(head);
     } else {
-        char *tail = agent_bash_read_tail_lines(job, AGENT_BASH_FINAL_TAIL_LINES);
+        int tail_lines = job->running ? AGENT_BASH_PROGRESS_TAIL_LINES :
+                                        AGENT_BASH_FINAL_TAIL_LINES;
+        char *tail = agent_bash_read_tail_lines(job, tail_lines);
         snprintf(line, sizeof(line),
-                 "tail -%d %s (final last lines of full output, not complete output):\n",
-                 AGENT_BASH_FINAL_TAIL_LINES, job->path);
+                 "output_path=%s (%zu bytes, %d lines)\n",
+                 job->path[0] ? job->path : "<unavailable>",
+                 job->bytes, display_lines);
+        agent_buf_puts(&out, line);
+        snprintf(line, sizeof(line), "<tail -%d %s>\n", tail_lines, job->path);
         agent_buf_puts(&out, line);
         agent_buf_puts(&out, tail);
         if (tail[0] && tail[strlen(tail) - 1] != '\n') agent_buf_puts(&out, "\n");
+        snprintf(line, sizeof(line), "</tail>\n");
+        agent_buf_puts(&out, line);
         free(tail);
     }
     if (job->running) {
         snprintf(line, sizeof(line),
-            "next: use bash_wait job=%d refresh_sec=60, bash_status job=%d, or bash_stop job=%d\n",
-            job->id, job->id, job->id);
+            "\nUse bash_status job=%d to get info before refresh time; use bash_stop job=%d to stop execution\n",
+            job->id, job->id);
         agent_buf_puts(&out, line);
     }
 
@@ -4676,25 +4742,38 @@ static char *agent_bash_observation(agent_bash_job *job, bool mark_observed) {
 
 static void agent_bash_publish_observation(agent_worker *w, const char *obs) {
     if (!obs || !obs[0]) return;
-    const char *line_end = strchr(obs, '\n');
-    size_t first_len = line_end ? (size_t)(line_end - obs + 1) : strlen(obs);
-    agent_publish(w, "\x1b[90m", 5);
-    agent_publish(w, obs, first_len);
-    agent_publish(w, "\x1b[0m", 4);
-
     const char *body = NULL;
-    const char *label = strstr(obs, "\nhead -");
-    if (!label) label = strstr(obs, "\ntail -");
+    const char *label = strstr(obs, "\n<head ");
+    const char *close = NULL;
     if (label) {
-        const char *colon = strstr(label, ":\n");
-        if (colon) body = colon + 2;
+        close = "</head>";
     } else {
-        label = strstr(obs, "\noutput (complete):\n");
-        if (label) body = label + strlen("\noutput (complete):\n");
+        label = strstr(obs, "\n<tail ");
+        if (label) close = "</tail>";
+    }
+    if (label) {
+        const char *tag_end = strstr(label, ">\n");
+        if (tag_end) {
+            agent_publish(w, "\x1b[90m", 5);
+            if (strstr(label, "\n<head ") == label)
+                agent_publish(w, "[showing first output lines]\n",
+                              strlen("[showing first output lines]\n"));
+            else
+                agent_publish(w, "[showing last output lines]\n",
+                              strlen("[showing last output lines]\n"));
+            agent_publish(w, "\x1b[0m", 4);
+            body = tag_end + 2;
+        }
+    } else {
+        label = strstr(obs, "\n<output>\n");
+        if (label) {
+            body = label + strlen("\n<output>\n");
+            close = "</output>";
+        }
     }
     if (!body || !body[0]) return;
-    const char *end = strstr(body, "\nnext:");
-    size_t n = end ? (size_t)(end - body + 1) : strlen(body);
+    const char *end = close ? strstr(body, close) : NULL;
+    size_t n = end ? (size_t)(end - body) : strlen(body);
     if (n) {
         bool failed = strstr(obs, "status=done") && !strstr(obs, "exit_status=0\n");
         if (failed) agent_publish(w, "\x1b[38;5;208m", 11);
@@ -4703,8 +4782,8 @@ static void agent_bash_publish_observation(agent_worker *w, const char *obs) {
     }
 }
 
-static void agent_bash_wait_refresh(agent_worker *w, agent_bash_job *job,
-                                    int refresh_sec) {
+static void agent_bash_refresh_for(agent_worker *w, agent_bash_job *job,
+                                   int refresh_sec) {
     double start = now_sec();
     while (job->running && now_sec() - start < refresh_sec) {
         if (worker_should_interrupt(w)) break;
@@ -4716,7 +4795,7 @@ static void agent_bash_wait_refresh(agent_worker *w, agent_bash_job *job,
     agent_bash_poll(job);
 }
 
-/* Common implementation for bash, bash_status, bash_wait, and bash_stop. */
+/* Common implementation for bash, bash_status, and bash_stop. */
 static char *agent_bash_job_tool_result(agent_worker *w, agent_bash_job *job,
                                         bool wait, int refresh_sec,
                                         bool stop, bool remove_if_done) {
@@ -4734,7 +4813,7 @@ static char *agent_bash_job_tool_result(agent_worker *w, agent_bash_job *job,
             kill(job->pid, SIGKILL);
         }
     }
-    if (wait || stop) agent_bash_wait_refresh(w, job, refresh_sec);
+    if (wait || stop) agent_bash_refresh_for(w, job, refresh_sec);
     else agent_bash_poll(job);
 
     char *obs = agent_bash_observation(job, true);
@@ -4788,7 +4867,6 @@ static char *agent_execute_tool_call(agent_worker *w, const agent_tool_call *cal
     }
 
     if (!strcmp(call->name, "bash_status") ||
-        !strcmp(call->name, "bash_wait") ||
         !strcmp(call->name, "bash_stop"))
     {
         int job_id = agent_tool_job_id(call);
@@ -4802,8 +4880,8 @@ static char *agent_execute_tool_call(agent_worker *w, const agent_tool_call *cal
         }
         int refresh = agent_parse_int_default(agent_tool_arg_value(call, "refresh_sec"),
                                               60, 1, 3600);
-        bool wait = !strcmp(call->name, "bash_wait");
         bool stop = !strcmp(call->name, "bash_stop");
+        bool wait = stop;
         return agent_bash_job_tool_result(w, job, wait, refresh, stop, true);
     }
 
@@ -4844,7 +4922,7 @@ static char *agent_bash_jobs_compaction_observation(agent_worker *w) {
     if (!w->bash_jobs) return NULL;
     agent_buf out = {0};
     agent_buf_puts(&out,
-        "Bash job update after context compaction. Running jobs still need explicit bash_wait, bash_status, or bash_stop if relevant.\n");
+        "Bash job update after context compaction. Running jobs still need explicit bash_status or bash_stop if relevant.\n");
     for (agent_bash_job *job = w->bash_jobs, *next = NULL; job; job = next) {
         next = job->next;
         char *obs = agent_bash_observation(job, true);
