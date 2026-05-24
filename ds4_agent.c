@@ -111,6 +111,7 @@ typedef struct {
     bool power_requested;
     int requested_power;
     int progress_base;
+    int last_system_prompt_reminder_at;
     char *cmd_text;
     agent_status status;
     char *out;
@@ -634,9 +635,9 @@ static ds4_think_mode effective_think_mode(const agent_config *cfg) {
  */
 
 static const char agent_tools_prompt_intro[] =
-    "You are a coding agent running in a local workspace. When the user asks you to inspect, create, "
-    "modify, build, test, or otherwise operate on local files, use tools instead of printing large file "
-    "contents as the answer.\n\n"
+    "You are a coding agent running in a local workspace. Use tools for local file and system work. "
+    "Avoid printing large file contents or large code blocks as answers; create or edit files with tools, "
+    "then summarize results briefly.\n\n"
     "## Tools\n\n"
     "You have access to native DSML tools. Invoke tools by writing exactly this shape:\n\n"
     "<｜DSML｜tool_calls>\n"
@@ -645,18 +646,18 @@ static const char agent_tools_prompt_intro[] =
     "</｜DSML｜invoke>\n"
     "</｜DSML｜tool_calls>\n\n"
     "Tool calls are not allowed inside <think></think>; finish thinking before emitting DSML.\n\n"
-    "String parameters use raw text and string=\"true\". Numbers and booleans use JSON text and string=\"false\". "
-    "For coding tasks, prefer a tool call over printing a complete source file inline. Also in final replies avoid "
-    "replying to the user with large amount of code if not strictly needed. After tools run, summarize the result briefly.\n\n"
+    "String parameters use raw text and string=\"true\". Numbers and booleans use JSON text and string=\"false\".\n\n"
     "Read defaults to a bounded chunk: path alone returns the first 500 lines, not the whole file. "
-    "If read says more lines are available, call the more tool with count=500 to read the next chunk. "
+    "If read says more lines are available, call more with count=<lines> to read the next chunk; "
+    "more defaults to the next 500 lines. "
     "The read result also reports continue_offset=N, which is the next start_line if you need to jump manually. "
     "If the user explicitly asks you to read a complete file into context, call read with whole=true. "
     "A whole-file read may fail if the result would not fit the current context; then explain that and use chunks.\n\n";
 
 static const char agent_tools_prompt_edit_line[] =
     "## Editing files\n\n"
-    "Use edit with path, old, and new. The old text must match exactly once in the current file, so edits are safe.\n"
+    "Use write for new files or deliberate whole-file replacement. Use edit with path, old, and new for changes. "
+    "The old text must match exactly once in the current file; otherwise edit fails for safety.\n"
     "For large replacements, prefer anchored old text: write the first lines, then [upto], then the final lines. "
     "The tool replaces everything from the head through the tail. If the head or tail is ambiguous, the edit fails.\n"
     "After [upto], always write unique final lines before closing old; never close old immediately after [upto].\n"
@@ -680,60 +681,163 @@ static const char agent_tools_prompt_edit_line[] =
     "}</｜DSML｜parameter>\n"
     "</｜DSML｜invoke>\n"
     "</｜DSML｜tool_calls>\n"
-    "Use insert with path, either before or after, and new to add text around an exact unique anchor. "
-    "Example C include insertion:\n"
-    "<｜DSML｜tool_calls>\n"
-    "<｜DSML｜invoke name=\"insert\">\n"
-    "<｜DSML｜parameter name=\"path\" string=\"true\">/tmp/example.c</｜DSML｜parameter>\n"
-    "<｜DSML｜parameter name=\"after\" string=\"true\">#include <stdio.h>\n</｜DSML｜parameter>\n"
-    "<｜DSML｜parameter name=\"new\" string=\"true\">#include <unistd.h>\n</｜DSML｜parameter>\n"
-    "</｜DSML｜invoke>\n"
-    "</｜DSML｜tool_calls>\n"
-    "Use read raw=true only when you need undecorated file text.\n\n";
+    "To insert text, use edit with old set to an exact unique anchor and new set to that anchor plus the added text.\n"
+    "Use read raw=true only when you need plain file text without line numbers or read annotations.\n\n";
 
 static const char agent_tools_prompt_after_edit[] =
     "For long-running bash commands, pass refresh_sec. If a bash job is still running, use "
     "bash_status to check it early or bash_stop to terminate it.\n\n"
     "### Available Tool Schemas\n\n"
-    "{\"type\":\"function\",\"function\":{\"name\":\"bash\",\"description\":\"Run a shell command.\","
-    "\"parameters\":{\"type\":\"object\",\"properties\":{\"command\":{\"type\":\"string\"},"
-    "\"timeout_sec\":{\"type\":\"number\"},\"refresh_sec\":{\"type\":\"number\"}},"
-    "\"required\":[\"command\"]}}}\n"
-    "{\"type\":\"function\",\"function\":{\"name\":\"bash_status\",\"description\":\"Report current status and new output for a bash job.\","
-    "\"parameters\":{\"type\":\"object\",\"properties\":{\"job\":{\"type\":\"number\"},"
-    "\"pid\":{\"type\":\"number\"},\"refresh_sec\":{\"type\":\"number\"}},\"required\":[\"job\"]}}}\n"
-    "{\"type\":\"function\",\"function\":{\"name\":\"bash_stop\",\"description\":\"Terminate a running bash job and report its final output.\","
-    "\"parameters\":{\"type\":\"object\",\"properties\":{\"job\":{\"type\":\"number\"},"
-    "\"pid\":{\"type\":\"number\"},\"refresh_sec\":{\"type\":\"number\"}},\"required\":[\"job\"]}}}\n"
-    "{\"type\":\"function\",\"function\":{\"name\":\"read\",\"description\":\"Read a text file or a range of lines.\","
-    "\"parameters\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"},"
-    "\"start_line\":{\"type\":\"number\"},\"max_lines\":{\"type\":\"number\"},"
-    "\"whole\":{\"type\":\"boolean\"},\"raw\":{\"type\":\"boolean\"}},\"required\":[\"path\"]}}}\n"
-    "{\"type\":\"function\",\"function\":{\"name\":\"more\",\"description\":\"Continue the previous read-like output.\","
-    "\"parameters\":{\"type\":\"object\",\"properties\":{\"count\":{\"type\":\"number\"}}}}}\n"
-    "{\"type\":\"function\",\"function\":{\"name\":\"write\",\"description\":\"Create or overwrite a text file.\","
-    "\"parameters\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"},"
-    "\"content\":{\"type\":\"string\"}},\"required\":[\"path\",\"content\"]}}}\n"
-    "{\"type\":\"function\",\"function\":{\"name\":\"edit\",\"description\":\"Replace exactly one old text match; old may contain [upto] between unique head and tail anchors.\","
-    "\"parameters\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"},"
-    "\"old\":{\"type\":\"string\"},\"new\":{\"type\":\"string\"}},\"required\":[\"path\",\"old\",\"new\"]}}}\n"
-    "{\"type\":\"function\",\"function\":{\"name\":\"insert\",\"description\":\"Insert text before or after exactly one anchor.\","
-    "\"parameters\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"},"
-    "\"before\":{\"type\":\"string\"},\"after\":{\"type\":\"string\"},\"new\":{\"type\":\"string\"}},"
-    "\"required\":[\"path\",\"new\"]}}}\n"
-    "{\"type\":\"function\",\"function\":{\"name\":\"search\",\"description\":\"Search files and return compact edit-friendly matches.\","
-    "\"parameters\":{\"type\":\"object\",\"properties\":{\"query\":{\"type\":\"string\"},"
-    "\"path\":{\"type\":\"string\"},\"mode\":{\"type\":\"string\"},\"glob\":{\"type\":\"string\"},"
-    "\"context\":{\"type\":\"number\"},\"max_results\":{\"type\":\"number\"},"
-    "\"case_sensitive\":{\"type\":\"boolean\"}},\"required\":[\"query\"]}}}\n"
-    "{\"type\":\"function\",\"function\":{\"name\":\"list\",\"description\":\"List one directory compactly.\","
-    "\"parameters\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"}},\"required\":[\"path\"]}}}\n"
+    "{\n"
+    "  \"type\": \"function\",\n"
+    "  \"function\": {\n"
+    "    \"name\": \"bash\",\n"
+    "    \"description\": \"Run a shell command.\",\n"
+    "    \"parameters\": {\n"
+    "      \"type\": \"object\",\n"
+    "      \"properties\": {\n"
+    "        \"command\": {\"type\": \"string\"},\n"
+    "        \"timeout_sec\": {\"type\": \"number\"},\n"
+    "        \"refresh_sec\": {\"type\": \"number\"}\n"
+    "      },\n"
+    "      \"required\": [\"command\"]\n"
+    "    }\n"
+    "  }\n"
+    "}\n\n"
+    "{\n"
+    "  \"type\": \"function\",\n"
+    "  \"function\": {\n"
+    "    \"name\": \"bash_status\",\n"
+    "    \"description\": \"Report current status and new output for a bash job.\",\n"
+    "    \"parameters\": {\n"
+    "      \"type\": \"object\",\n"
+    "      \"properties\": {\n"
+    "        \"job\": {\"type\": \"number\"},\n"
+    "        \"pid\": {\"type\": \"number\"},\n"
+    "        \"refresh_sec\": {\"type\": \"number\"}\n"
+    "      },\n"
+    "      \"required\": [\"job\"]\n"
+    "    }\n"
+    "  }\n"
+    "}\n\n"
+    "{\n"
+    "  \"type\": \"function\",\n"
+    "  \"function\": {\n"
+    "    \"name\": \"bash_stop\",\n"
+    "    \"description\": \"Terminate a running bash job and report its final output.\",\n"
+    "    \"parameters\": {\n"
+    "      \"type\": \"object\",\n"
+    "      \"properties\": {\n"
+    "        \"job\": {\"type\": \"number\"},\n"
+    "        \"pid\": {\"type\": \"number\"},\n"
+    "        \"refresh_sec\": {\"type\": \"number\"}\n"
+    "      },\n"
+    "      \"required\": [\"job\"]\n"
+    "    }\n"
+    "  }\n"
+    "}\n\n"
+    "{\n"
+    "  \"type\": \"function\",\n"
+    "  \"function\": {\n"
+    "    \"name\": \"read\",\n"
+    "    \"description\": \"Read a text file or a range of lines.\",\n"
+    "    \"parameters\": {\n"
+    "      \"type\": \"object\",\n"
+    "      \"properties\": {\n"
+    "        \"path\": {\"type\": \"string\"},\n"
+    "        \"start_line\": {\"type\": \"number\"},\n"
+    "        \"max_lines\": {\"type\": \"number\"},\n"
+    "        \"whole\": {\"type\": \"boolean\"},\n"
+    "        \"raw\": {\"type\": \"boolean\"}\n"
+    "      },\n"
+    "      \"required\": [\"path\"]\n"
+    "    }\n"
+    "  }\n"
+    "}\n\n"
+    "{\n"
+    "  \"type\": \"function\",\n"
+    "  \"function\": {\n"
+    "    \"name\": \"more\",\n"
+    "    \"description\": \"Continue the previous read-like output.\",\n"
+    "    \"parameters\": {\n"
+    "      \"type\": \"object\",\n"
+    "      \"properties\": {\n"
+    "        \"count\": {\"type\": \"number\"}\n"
+    "      }\n"
+    "    }\n"
+    "  }\n"
+    "}\n\n"
+    "{\n"
+    "  \"type\": \"function\",\n"
+    "  \"function\": {\n"
+    "    \"name\": \"write\",\n"
+    "    \"description\": \"Create or overwrite a text file.\",\n"
+    "    \"parameters\": {\n"
+    "      \"type\": \"object\",\n"
+    "      \"properties\": {\n"
+    "        \"path\": {\"type\": \"string\"},\n"
+    "        \"content\": {\"type\": \"string\"}\n"
+    "      },\n"
+    "      \"required\": [\"path\", \"content\"]\n"
+    "    }\n"
+    "  }\n"
+    "}\n\n"
+    "{\n"
+    "  \"type\": \"function\",\n"
+    "  \"function\": {\n"
+    "    \"name\": \"edit\",\n"
+    "    \"description\": \"Replace exactly one old text match; old may contain [upto] between unique head and tail anchors.\",\n"
+    "    \"parameters\": {\n"
+    "      \"type\": \"object\",\n"
+    "      \"properties\": {\n"
+    "        \"path\": {\"type\": \"string\"},\n"
+    "        \"old\": {\"type\": \"string\"},\n"
+    "        \"new\": {\"type\": \"string\"}\n"
+    "      },\n"
+    "      \"required\": [\"path\", \"old\", \"new\"]\n"
+    "    }\n"
+    "  }\n"
+    "}\n\n"
+    "{\n"
+    "  \"type\": \"function\",\n"
+    "  \"function\": {\n"
+    "    \"name\": \"search\",\n"
+    "    \"description\": \"Search files and return compact edit-friendly matches.\",\n"
+    "    \"parameters\": {\n"
+    "      \"type\": \"object\",\n"
+    "      \"properties\": {\n"
+    "        \"query\": {\"type\": \"string\"},\n"
+    "        \"path\": {\"type\": \"string\"},\n"
+    "        \"mode\": {\"type\": \"string\"},\n"
+    "        \"glob\": {\"type\": \"string\"},\n"
+    "        \"context\": {\"type\": \"number\"},\n"
+    "        \"max_results\": {\"type\": \"number\"},\n"
+    "        \"case_sensitive\": {\"type\": \"boolean\"}\n"
+    "      },\n"
+    "      \"required\": [\"query\"]\n"
+    "    }\n"
+    "  }\n"
+    "}\n\n"
+    "{\n"
+    "  \"type\": \"function\",\n"
+    "  \"function\": {\n"
+    "    \"name\": \"list\",\n"
+    "    \"description\": \"List one directory compactly.\",\n"
+    "    \"parameters\": {\n"
+    "      \"type\": \"object\",\n"
+    "      \"properties\": {\n"
+    "        \"path\": {\"type\": \"string\"}\n"
+    "      },\n"
+    "      \"required\": [\"path\"]\n"
+    "    }\n"
+    "  }\n"
+    "}\n"
     "\n"
     "# Rules\n\n"
     "- Always use strict syntax for DSML tool stanzas.\n"
     "- This system runs on local inference of a few hundred tokens/s of prefill, "
     "and a few tens of tokens/s decoding speed. Use read/search to get the "
-    "anchors you need, then use anchored edit or insert to avoid having to "
+    "anchors you need, then use anchored edit to avoid having to "
     "retype large text.\n"
     "- Write code that is reliable and works well; always have a mental model of "
     "what is going on in complex parts of the code.\n"
@@ -749,6 +853,30 @@ static char *agent_build_tools_prompt(void) {
     memcpy(out, agent_tools_prompt_intro, a);
     memcpy(out + a, edit, b);
     memcpy(out + a + b, agent_tools_prompt_after_edit, c + 1);
+    return out;
+}
+
+static const char agent_dsml_syntax_reminder[] =
+    "DSML syntax reminder:\n"
+    "<｜DSML｜tool_calls>\n"
+    "<｜DSML｜invoke name=\"$TOOL_NAME\">\n"
+    "<｜DSML｜parameter name=\"$PARAMETER_NAME\" string=\"true|false\">$PARAMETER_VALUE</｜DSML｜parameter>\n"
+    "</｜DSML｜invoke>\n"
+    "</｜DSML｜tool_calls>\n";
+
+#define AGENT_SYSTEM_PROMPT_REMINDER_TOKENS 50000
+
+static char *agent_build_system_prompt_reminder(void) {
+    char *tools = agent_build_tools_prompt();
+    const char *start = "\n\n[System prompt reminder follows.]\n";
+    const char *end = "[End system prompt reminder.]\n\n";
+    size_t len = strlen(start) + strlen(tools) + strlen(end) + 1;
+    char *out = xmalloc(len);
+    out[0] = '\0';
+    strcat(out, start);
+    strcat(out, tools);
+    strcat(out, end);
+    free(tools);
     return out;
 }
 
@@ -770,6 +898,41 @@ static void agent_append_system_prompt(ds4_engine *engine, ds4_tokens *tokens,
     memcpy(plain + 2, extra, n + 1);
     ds4_chat_append_message(engine, tokens, "system", plain);
     free(plain);
+}
+
+static void agent_worker_note_system_prompt_seen(agent_worker *w) {
+    w->last_system_prompt_reminder_at = w->transcript.len;
+}
+
+/* The full tool/system reminder is separate from DSML syntax errors: it is a
+ * pressure-controlled refresh of the same trusted prompt shape used at startup.
+ * The built-in prompt is tokenized as rendered chat so DSML markers stay native
+ * control tokens; arbitrary -sys text remains ordinary text. */
+static void agent_worker_maybe_append_system_prompt_reminder(agent_worker *w) {
+    if (w->last_system_prompt_reminder_at <= 0) {
+        agent_worker_note_system_prompt_seen(w);
+        return;
+    }
+    if (w->transcript.len - w->last_system_prompt_reminder_at <
+        AGENT_SYSTEM_PROMPT_REMINDER_TOKENS)
+    {
+        return;
+    }
+
+    char *reminder = agent_build_system_prompt_reminder();
+    ds4_tokenize_rendered_chat(w->engine, reminder, &w->transcript);
+    free(reminder);
+
+    const char *extra = w->cfg->gen.system;
+    if (extra && extra[0]) {
+        ds4_tokenize_text(w->engine,
+            "\nAdditional system instructions reminder:\n", &w->transcript);
+        ds4_tokenize_text(w->engine, extra, &w->transcript);
+        ds4_tokenize_text(w->engine,
+            "\n[End additional system instructions reminder.]\n\n",
+            &w->transcript);
+    }
+    agent_worker_note_system_prompt_seen(w);
 }
 
 /* Wake the UI thread after changing worker-visible state.  The byte in
@@ -2342,7 +2505,7 @@ static agent_tool_param_kind agent_tool_param_kind_for(const char *tool, const c
         return AGENT_TOOL_PARAM_BASH_COMMAND;
     if (!strcmp(tool, "edit") && !strcmp(param, "old"))
         return AGENT_TOOL_PARAM_DIFF_OLD;
-    if ((!strcmp(tool, "edit") || !strcmp(tool, "insert")) && !strcmp(param, "new"))
+    if (!strcmp(tool, "edit") && !strcmp(param, "new"))
         return AGENT_TOOL_PARAM_DIFF_NEW;
     if (streq_any(param, "path", "file", "filename", NULL))
         return AGENT_TOOL_PARAM_PATH;
@@ -2408,7 +2571,6 @@ static const char *agent_tool_viz_prefix(const char *name) {
     if (!strcmp(name, "read")) return "read ";
     if (!strcmp(name, "write")) return "write ";
     if (!strcmp(name, "edit")) return "edit ";
-    if (!strcmp(name, "insert")) return "insert ";
     if (!strcmp(name, "search")) return "search ";
     return NULL;
 }
@@ -2504,9 +2666,6 @@ static bool agent_tool_viz_param_is_code_body(agent_tool_visualizer *v) {
         (v->param_kind == AGENT_TOOL_PARAM_DIFF_OLD ||
          v->param_kind == AGENT_TOOL_PARAM_DIFF_NEW ||
          v->param_kind == AGENT_TOOL_PARAM_CONTENT))
-        return true;
-    if (!strcmp(v->tool_name, "insert") &&
-        v->param_kind == AGENT_TOOL_PARAM_DIFF_NEW)
         return true;
     return false;
 }
@@ -3553,6 +3712,7 @@ static bool agent_worker_reset_to_sysprompt(agent_worker *w, char *err, size_t e
         }
     }
 
+    agent_worker_note_system_prompt_seen(w);
     pthread_mutex_lock(&w->mu);
     w->user_activity = false;
     w->session_dirty = false;
@@ -4326,6 +4486,7 @@ static bool agent_worker_switch_session(agent_worker *w, const char *prefix,
     if (ok) {
         ds4_tokens_free(&w->transcript);
         w->transcript = loaded;
+        agent_worker_note_system_prompt_seen(w);
         pthread_mutex_lock(&w->mu);
         w->user_activity = true;
         w->session_dirty = false;
@@ -4613,7 +4774,7 @@ static char *agent_read_range(agent_worker *w, const char *path, int start_line,
             char note[160];
             snprintf(note, sizeof(note),
                      "[Read truncated at line %d of %d. continue_offset=%d. "
-                     "Call the more tool with count=%d to read the next chunk.]\n",
+                     "Call more with count=%d to read the next chunk.]\n",
                      end_idx, spans.len, end_idx + 1,
                      max_lines > 0 ? max_lines : AGENT_READ_DEFAULT_LINES);
             agent_buf_puts(&out, note);
@@ -4623,7 +4784,7 @@ static char *agent_read_range(agent_worker *w, const char *path, int start_line,
         if (end_idx < spans.len) {
             snprintf(hdr, sizeof(hdr),
                      "%s: lines %d-%d of %d; continue_offset=%d; "
-                     "call the more tool with count=%d to read the next chunk\n",
+                     "call more with count=%d to read the next chunk\n",
                      path, spans.len ? start_idx + 1 : 0, end_idx, spans.len,
                      end_idx + 1, max_lines > 0 ? max_lines : AGENT_READ_DEFAULT_LINES);
         } else {
@@ -5107,8 +5268,8 @@ static char *agent_apply_file_splice(const char *path,
 }
 
 /* Old/new editing is intentionally conservative: exact old text must be unique.
- * For large replacements, old may contain one [upto] marker; then both the head
- * and tail anchors must be independently unique before the whole span is
+ * For large replacements, old may contain one [upto] marker: the head must be
+ * unique, and the tail must be unique after that head before the whole span is
  * replaced. */
 static char *agent_tool_edit(agent_worker *w, const agent_tool_call *call) {
     (void)w;
@@ -5149,52 +5310,6 @@ static char *agent_tool_edit(agent_worker *w, const agent_tool_call *call) {
                                            new_text,
                                            anchored ? "anchored old/new replacement"
                                                     : "old/new replacement");
-    free(data);
-    return result;
-}
-
-static char *agent_tool_insert(agent_worker *w, const agent_tool_call *call) {
-    (void)w;
-    const char *path = agent_tool_arg_value(call, "path");
-    const char *before = agent_tool_arg_value(call, "before");
-    const char *after = agent_tool_arg_value(call, "after");
-    const char *new_text = agent_tool_arg_value(call, "new");
-    if (!path || !path[0]) return xstrdup("Tool error: insert requires path\n");
-    if (!new_text) return xstrdup("Tool error: insert requires new text\n");
-    if ((before && after) || (!before && !after))
-        return xstrdup("Tool error: insert requires exactly one of before or after\n");
-
-    char err[256];
-    char *data = NULL;
-    size_t len = 0;
-    if (agent_read_file_bytes(path, &data, &len, err, sizeof(err)) != 0) {
-        agent_buf b = {0};
-        agent_buf_puts(&b, "Tool error: ");
-        agent_buf_puts(&b, err);
-        agent_buf_puts(&b, "\n");
-        return agent_buf_take(&b);
-    }
-
-    const char *anchor = before ? before : after;
-    size_t anchor_len = strlen(anchor);
-    const char *match = NULL;
-    if (!agent_find_unique(data, len, anchor, anchor_len, &match,
-                           before ? "before" : "after", err, sizeof(err)))
-    {
-        free(data);
-        agent_buf b = {0};
-        agent_buf_puts(&b, "Tool error: ");
-        agent_buf_puts(&b, err);
-        agent_buf_puts(&b, "\n");
-        return agent_buf_take(&b);
-    }
-
-    size_t offset = before ? (size_t)(match - data) :
-                             (size_t)(match - data) + anchor_len;
-    char *result = agent_apply_file_splice(path, data, len, offset, 0,
-                                           new_text,
-                                           before ? "insert before anchor"
-                                                  : "insert after anchor");
     free(data);
     return result;
 }
@@ -5868,7 +5983,6 @@ static char *agent_execute_tool_call(agent_worker *w, const agent_tool_call *cal
     if (!strcmp(call->name, "write")) return agent_tool_write(w, call);
     if (!strcmp(call->name, "list")) return agent_tool_list(call);
     if (!strcmp(call->name, "edit")) return agent_tool_edit(w, call);
-    if (!strcmp(call->name, "insert")) return agent_tool_insert(w, call);
     if (!strcmp(call->name, "search")) return agent_tool_search(w, call);
 
     if (!strcmp(call->name, "bash")) {
@@ -6195,6 +6309,7 @@ static bool agent_worker_compact(agent_worker *w, const char *reason,
         ds4_tokens_free(&sys);
         return false;
     }
+    agent_worker_note_system_prompt_seen(w);
     ds4_tokens_free(&old_transcript);
     ds4_tokens_free(&sys);
     char *bash_update = agent_bash_jobs_compaction_observation(w);
@@ -6319,6 +6434,7 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
             agent_set_error(w, compact_err[0] ? compact_err : "context compaction failed");
             return 1;
         }
+        agent_worker_maybe_append_system_prompt_reminder(w);
         ds4_chat_append_assistant_prefix(w->engine, &w->transcript, think_mode);
 
         const ds4_tokens *prompt_for_sync = &w->transcript;
@@ -6461,6 +6577,7 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
                 agent_buf_puts(&b, "Tool error: invalid DSML tool call: ");
                 agent_buf_puts(&b, dsml.error[0] ? dsml.error : "parse error");
                 agent_buf_puts(&b, "\n");
+                agent_buf_puts(&b, agent_dsml_syntax_reminder);
                 agent_buf_puts(&b, "Tool execution stopped because a queued user prompt is pending.\n");
                 tool_result = agent_buf_take(&b);
             } else if (early_tool_error) {
@@ -6496,6 +6613,7 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
             agent_buf_puts(&b, "Tool error: invalid DSML tool call: ");
             agent_buf_puts(&b, dsml.error[0] ? dsml.error : "parse error");
             agent_buf_puts(&b, "\n");
+            agent_buf_puts(&b, agent_dsml_syntax_reminder);
             tool_result = agent_buf_take(&b);
         } else {
             tool_result = agent_execute_tool_calls(w, &dsml.calls);
