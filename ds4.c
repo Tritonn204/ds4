@@ -15854,6 +15854,10 @@ void ds4_chat_append_max_effort_prefix(ds4_engine *e, ds4_tokens *tokens) {
 }
 
 static void bpe_tokenize_tool_result_text(ds4_vocab *vocab, const char *content, token_vec *out) {
+    /* Tool output is plain data inside <tool_result>...</tool_result>.
+     * Preserve literal '<', '>' and '&' so shell output and file snippets stay
+     * intact, but escape the exact closing sentinel so a malicious or accidental
+     * tool payload cannot terminate the wrapper early. */
     const char *end = "</tool_result>";
     const size_t endlen = strlen(end);
     const char *span = content ? content : "";

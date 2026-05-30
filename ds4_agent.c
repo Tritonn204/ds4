@@ -4415,9 +4415,34 @@ static bool agent_history_has_prefix(const char *p, const char *end,
     return (size_t)(end - p) >= n && memcmp(p, prefix, n) == 0;
 }
 
+/* Tool messages are rendered as user turns in the transcript.  Return the
+ * inner payload for the current <tool_result> wrapper so /history skips these
+ * pseudo-user turns and displays their content without leaking the wrapper. */
+static bool agent_history_tool_result_payload(const char **p, const char **end) {
+    const char *s = *p, *e = *end;
+    agent_history_trim(&s, &e);
+
+    const char *open = "<tool_result>";
+    const char *close = "</tool_result>";
+    const size_t open_len = strlen(open);
+    const size_t close_len = strlen(close);
+    if (!agent_history_has_prefix(s, e, open)) return false;
+
+    s += open_len;
+    if ((size_t)(e - s) >= close_len &&
+        memcmp(e - close_len, close, close_len) == 0)
+    {
+        e -= close_len;
+    }
+    *p = s;
+    *end = e;
+    return true;
+}
+
 static bool agent_history_is_tool_user(const char *p, const char *end) {
     agent_history_trim(&p, &end);
-    return agent_history_has_prefix(p, end, "Tool:") ||
+    return agent_history_tool_result_payload(&p, &end) ||
+           agent_history_has_prefix(p, end, "Tool:") ||
            agent_history_has_prefix(p, end, "Tool result");
 }
 
@@ -4704,13 +4729,18 @@ static void agent_history_render_text(agent_worker *w, const char *text,
 
         if (mark == AGENT_HISTORY_MARK_USER) {
             if (agent_history_is_tool_user(tp, te)) {
+                const char *payload_start = tp;
+                const char *payload_end = te;
+                (void)agent_history_tool_result_payload(&payload_start,
+                                                        &payload_end);
                 if (color) {
                     const char *s = "\x1b[90mTool result:\n";
                     agent_publish(w, s, strlen(s));
                 } else {
                     agent_publish(w, "Tool result:\n", strlen("Tool result:\n"));
                 }
-                agent_history_publish_limited(w, tp, te, 12, 3000);
+                agent_history_publish_limited(w, payload_start, payload_end,
+                                              12, 3000);
                 if (color) agent_publish(w, "\x1b[0m", 4);
             } else {
                 if (color) {
