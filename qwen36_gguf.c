@@ -44,6 +44,10 @@ static bool read_u64(qwen36_reader *r, uint64_t *out, char *err, size_t err_cap)
     return read_exact(r, out, sizeof(*out), err, err_cap);
 }
 
+static uint64_t pad_u64(uint64_t x, uint64_t n) {
+    return ((x + n - 1) / n) * n;
+}
+
 static bool read_string(qwen36_reader *r, char **out, char *err, size_t err_cap) {
     uint64_t len = 0;
     char *s = NULL;
@@ -152,6 +156,7 @@ bool qwen36_gguf_open(qwen36_gguf_file *out, const char *path, char *err, size_t
     qwen36_reader r;
     uint32_t magic = 0;
     uint64_t i = 0;
+    long meta_end = 0;
     long end = 0;
 
     memset(out, 0, sizeof(*out));
@@ -215,6 +220,22 @@ bool qwen36_gguf_open(qwen36_gguf_file *out, const char *path, char *err, size_t
             return false;
         }
     }
+    out->alignment = 32;
+    {
+        const qwen36_gguf_kv *align_kv = qwen36_gguf_find_kv(out, "general.alignment");
+        if (align_kv) {
+            switch (align_kv->type) {
+            case QWEN36_GGUF_VALUE_UINT32:
+                if (align_kv->v.u32 != 0) out->alignment = align_kv->v.u32;
+                break;
+            case QWEN36_GGUF_VALUE_UINT64:
+                if (align_kv->v.u64 != 0 && align_kv->v.u64 <= UINT32_MAX) out->alignment = (uint32_t)align_kv->v.u64;
+                break;
+            default:
+                break;
+            }
+        }
+    }
     for (i = 0; i < out->tensor_count; i++) {
         qwen36_gguf_tensor *t = &out->tensors[i];
         uint32_t d = 0;
@@ -243,6 +264,17 @@ bool qwen36_gguf_open(qwen36_gguf_file *out, const char *path, char *err, size_t
             fclose(r.fp);
             return false;
         }
+    }
+    meta_end = ftell(r.fp);
+    if (meta_end < 0) {
+        set_err(err, err_cap, "failed to locate GGUF data section");
+        qwen36_gguf_close(out);
+        fclose(r.fp);
+        return false;
+    }
+    out->data_start = pad_u64((uint64_t)meta_end, out->alignment ? out->alignment : 32);
+    for (i = 0; i < out->tensor_count; i++) {
+        out->tensors[i].abs_offset = out->data_start + out->tensors[i].rel_offset;
     }
     fclose(r.fp);
     return true;
@@ -278,6 +310,39 @@ const qwen36_gguf_kv *qwen36_gguf_find_kv(const qwen36_gguf_file *gf, const char
     return NULL;
 }
 
+bool qwen36_gguf_read_tensor_bytes(const qwen36_gguf_file *gf, const qwen36_gguf_tensor *t,
+                                   uint64_t byte_offset, void *dst, size_t n,
+                                   char *err, size_t err_cap) {
+    FILE *fp;
+    uint64_t abs_pos;
+    if (!gf || !t || !dst) {
+        set_err(err, err_cap, "bad read_tensor_bytes args");
+        return false;
+    }
+    abs_pos = t->abs_offset + byte_offset;
+    if (abs_pos + n > gf->file_size) {
+        set_err(err, err_cap, "tensor read past EOF: %s", t->name ? t->name : "<unnamed>");
+        return false;
+    }
+    fp = fopen(gf->path, "rb");
+    if (!fp) {
+        set_err(err, err_cap, "open %s: %s", gf->path, strerror(errno));
+        return false;
+    }
+    if (fseeko(fp, (off_t)abs_pos, SEEK_SET) != 0) {
+        set_err(err, err_cap, "seek %s failed", t->name ? t->name : "<unnamed>");
+        fclose(fp);
+        return false;
+    }
+    if (fread(dst, 1, n, fp) != n) {
+        set_err(err, err_cap, "read %s failed", t->name ? t->name : "<unnamed>");
+        fclose(fp);
+        return false;
+    }
+    fclose(fp);
+    return true;
+}
+
 const qwen36_gguf_tensor *qwen36_gguf_find_tensor(const qwen36_gguf_file *gf, const char *name) {
     uint64_t i;
     for (i = 0; i < gf->tensor_count; i++) {
@@ -295,7 +360,9 @@ const char *qwen36_gguf_type_name(uint32_t type) {
     case 12: return "q4_k";
     case 13: return "q5_k";
     case 14: return "q6_k";
-    case 16: return "iq2_xxs";
+    case QWEN36_GGUF_TYPE_IQ2_XXS: return "iq2_xxs";
+    case QWEN36_GGUF_TYPE_IQ3_S: return "iq3_s";
+    case QWEN36_GGUF_TYPE_IQ2_S: return "iq2_s";
     default: return "unknown";
     }
 }

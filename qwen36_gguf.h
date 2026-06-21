@@ -10,7 +10,13 @@
 enum {
     QWEN36_GGUF_TYPE_F32  = 0,
     QWEN36_GGUF_TYPE_F16  = 1,
+    QWEN36_GGUF_TYPE_Q4_K = 12,
+    QWEN36_GGUF_TYPE_Q5_K = 13,
+    QWEN36_GGUF_TYPE_Q6_K = 14,
     QWEN36_GGUF_TYPE_Q8_0 = 8,
+    QWEN36_GGUF_TYPE_IQ2_XXS = 16,
+    QWEN36_GGUF_TYPE_IQ3_S = 21,
+    QWEN36_GGUF_TYPE_IQ2_S = 22,
 };
 
 enum {
@@ -68,12 +74,15 @@ typedef struct qwen36_gguf_tensor {
     uint64_t dims[QWEN36_GGUF_MAX_DIMS];
     uint32_t type;
     uint64_t rel_offset;
+    uint64_t abs_offset;
 } qwen36_gguf_tensor;
 
 typedef struct qwen36_gguf_file {
     char               *path;
     uint32_t            version;
+    uint32_t            alignment;
     uint64_t            file_size;
+    uint64_t            data_start;
     uint64_t            tensor_count;
     uint64_t            kv_count;
     qwen36_gguf_kv     *kvs;
@@ -82,6 +91,9 @@ typedef struct qwen36_gguf_file {
 
 bool qwen36_gguf_open(qwen36_gguf_file *out, const char *path, char *err, size_t err_cap);
 void qwen36_gguf_close(qwen36_gguf_file *gf);
+bool qwen36_gguf_read_tensor_bytes(const qwen36_gguf_file *gf, const qwen36_gguf_tensor *t,
+                                   uint64_t byte_offset, void *dst, size_t n,
+                                   char *err, size_t err_cap);
 
 const qwen36_gguf_kv *qwen36_gguf_find_kv(const qwen36_gguf_file *gf, const char *key);
 const qwen36_gguf_tensor *qwen36_gguf_find_tensor(const qwen36_gguf_file *gf, const char *name);

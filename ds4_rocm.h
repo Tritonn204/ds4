@@ -1,6 +1,9 @@
 #pragma once
 
 #include <hip/hip_runtime.h>
+#ifndef HIPBLAS_V2
+#define HIPBLAS_V2
+#endif
 #include <hipblas/hipblas.h>
 #include <hip/hip_fp16.h>
 #include <hipcub/hipcub.hpp>
@@ -91,6 +94,29 @@
 #define cublasGemmStridedBatchedEx hipblasGemmStridedBatchedEx
 
 namespace cub = hipcub;
+
+#if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
+template <typename T>
+static __device__ __forceinline__ T __shfl_sync(unsigned, T var, int src_lane, int width = warpSize) {
+    return __shfl(var, src_lane, width);
+}
+
+template <typename T>
+static __device__ __forceinline__ T __shfl_down_sync(unsigned, T var, unsigned delta, int width = warpSize) {
+    return __shfl_down(var, delta, width);
+}
+
+template <typename T>
+static __device__ __forceinline__ T __shfl_xor_sync(unsigned, T var, int lane_mask, int width = warpSize) {
+    return __shfl_xor(var, lane_mask, width);
+}
+
+static __device__ __forceinline__ void __syncwarp(unsigned = 0xffffffffu) {
+#if defined(__AMDGCN__)
+    __builtin_amdgcn_wave_barrier();
+#endif
+}
+#endif
 
 static __device__ __forceinline__ int32_t __vcmpne4(uint32_t a, uint32_t b) {
     // For each byte: 0xFF if a != b, 0x00 if a == b
