@@ -2336,3 +2336,85 @@ What this proves:
 - the earlier `GPU blk.0..2` failure was a prefix-chain ownership bug, not evidence that `blk.1` hybrid math had regressed
 - the narrow GPU-owned hybrid prefix now composes correctly through `blk.2` on the fast oracle prompt
 - the next useful validation is no longer another microscopic chain audit; it is a longer prompt / multi-token greedy check on the repaired owned GPU prefix
+
+## Direct Hybrid GGUF Contract Check
+
+To avoid blindly starting a fixture-free runtime, we added a direct GGUF-vs-fixture checker:
+
+- binary: `qwen36-direct-hybrid-contract-check`
+- input:
+  - a `Qwen3.6-35B-A3B-Q8_0.gguf`
+  - one traced hybrid-layer fixture such as `blk.0`
+- goal:
+  - compare the already-proven fixture weight surfaces against direct GGUF tensors
+  - identify which tensors are already runtime-ready
+  - identify which tensors still need Qwen-specific transform logic
+
+Ran on:
+
+- model: `Qwen3.6-35B-A3B-Q8_0.gguf`
+- fixture: `blk.0` `code_review` trace
+
+Direct matches already proven:
+
+- `attn_norm`
+  - RMSE: `0.0`
+  - cosine: `1.0`
+- `post_attn_norm`
+  - RMSE: `0.0`
+  - cosine: `1.0`
+- `attn_gate`
+  - raw: bad
+  - reordered by head groups: exact
+- `ssm_alpha`
+  - raw: bad
+  - reordered by head groups: exact
+- `ssm_beta`
+  - raw: bad
+  - reordered by head groups: exact
+- `ssm_norm`
+  - RMSE: `0.0`
+  - cosine: `1.0`
+- `router_w`
+  - RMSE: `0.0`
+  - cosine: `1.0`
+- shared-expert weights
+  - `gate_shexp`, `up_shexp`, `down_shexp`, `gate_inp_shexp`
+  - all exact
+
+Direct contract surfaces now explained:
+
+- `attn_qkv.weight`
+  - raw direct rows do not match fixture contract
+  - the known Qwen V-row remap restores exact agreement
+- `ssm_conv1d.weight`
+  - raw direct rows are only partially aligned
+  - naive transpose is wrong
+  - the same Qwen V-row remap restores exact agreement
+- `ssm_a`
+  - raw direct tensor does not match
+  - simple head-scalar reorder restores exact agreement
+  - note: this fixture surface is the GGUF-native decay coefficient despite older `A_log` naming
+- `ssm_dt_bias`
+  - raw direct tensor does not match
+  - simple head-scalar reorder restores exact agreement
+- `ssm_out.weight`
+  - raw direct rows do not match fixture `w_out`
+  - the known Qwen V-head column reorder restores exact agreement
+
+Interpretation:
+
+- the hybrid block is now structurally explained from direct GGUF:
+  - norms
+  - router
+  - shared expert
+  - all hybrid projection and bridge tensors after the known head/column reorder rules
+- the remaining blocker is no longer hidden hybrid tensor layout
+- the next blocker is engineering:
+  - turning the proven direct-GGUF contract into a persistent incremental owned worker
+  - preserving hybrid recurrent state, conv history, and full-attention cache across decode steps
+
+This materially changes the next runtime step:
+
+- a real fixture-free persistent worker should not be started from a naive direct-GGUF hybrid implementation
+- after encoding these proven reorder rules, the remaining work is stateful decode ownership rather than contract discovery
