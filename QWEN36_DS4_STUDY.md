@@ -2418,3 +2418,215 @@ This materially changes the next runtime step:
 
 - a real fixture-free persistent worker should not be started from a naive direct-GGUF hybrid implementation
 - after encoding these proven reorder rules, the remaining work is stateful decode ownership rather than contract discovery
+
+## Reset Point: Last Proven Qwen Path
+
+After the later direct-worker and DeepSeek detours, the correct reset point is still the fixture-driven narrow Qwen path, not the direct GGUF incremental worker.
+
+Trust this stack:
+
+- `qwen36_gpu_blk0_dynamic_q8_oracle`
+  - fixed chained-input ownership bug
+  - proven good enough for splice checks
+- `qwen36_c_prefix_q8_chain_dynamic`
+  - trusted dynamic hybrid replay for the owned linear-attention blocks
+  - this is the proven CPU/GPU-owned prefix composition path, even though it still replays the full prefix
+- `qwen36_gpu_full_layer_q8_dynamic`
+  - trusted full-attention ownership block for the `blk.3 / 7 / 11 / 15` positions
+- `misc/qwen36_hybrid_prefix_tail_greedy.py`
+  - trusted harness for the known-good replay-based owned prefix
+- `misc/qwen36_strict_first_step_validator.py`
+  - trusted strict prompt-bound validator
+- `misc/qwen36_shared_path_forced_validator.py`
+  - trusted forced-token fidelity probe
+- `misc/qwen36_long_decode_ab.py`
+  - trusted behavioral long-decode A/B harness
+
+Do **not** currently build on:
+
+- `qwen36_incremental_worker.c`
+- `qwen36-incremental-worker`
+
+Reason:
+
+- we added a real `STEP <token_id>` path so it now reuses conv history, DeltaNet state, and loaded experts instead of restarting from scratch
+- however, the direct worker is still mathematically wrong even before cache reuse becomes relevant
+
+Observed append test on `prompt="Hello world"`:
+
+- HF prompt forward
+  - next token: `!`
+- worker prefill
+  - completed successfully
+- worker step
+  - completed successfully
+- fidelity vs HF `blk.0`
+  - `prompt_seq_cosine: -0.02770423`
+  - `full_seq_cosine: -0.01814704`
+  - `step_last_cosine: 0.00863440`
+
+Interpretation:
+
+- the direct worker is not “almost correct”
+- its internal contract is still wrong enough that the persistent cache protocol is irrelevant
+- therefore it should be treated as a failed exploratory branch, not the basis for the next runtime layer
+
+Practical consequence:
+
+- the next serious persistent-runtime attempt should be built upward from the last proven Qwen replay stack above
+- that means:
+  - keep the proven fixture-driven dynamic layer math
+  - keep the proven GPU full-attention block
+  - add persistence and append/state reuse **on top of that**
+  - do **not** restart from the direct GGUF worker until its math is independently repaired
+
+## Persistent `blk.0` Worker Reset
+
+We started the cache-reuse rebuild from the last proven fixture-driven path rather than from the failed direct-GGUF worker.
+
+New artifact:
+
+- `qwen36-fixture-blk0-worker`
+
+Purpose:
+
+- own `blk.0` persistently using the proven `Q36DWF02` fixture contract
+- retain:
+  - conv ring state
+  - DeltaNet state
+  - output sequence
+  - loaded expert cache
+- support:
+  - `PREFILL_PREFIX <prefix.bin>`
+  - `STEP <token_id>`
+  - `DUMP_HIDDEN`
+
+Harness integration:
+
+- `misc/qwen36_hybrid_prefix_tail_greedy.py`
+  - added `--prefix-seq-worker-bin`
+  - added a persistent subprocess wrapper `PrefixSeqWorker`
+  - fixed fixture counting so worker mode accepts `3N-1` hybrid fixtures
+  - fixed handoff so downstream dynamic hybrid replay receives `--use-prefix-input-seq`
+
+What we proved in sandbox:
+
+- the worker starts correctly on the known-good `blk.0` code-review fixture
+- the worker prefill path emits a valid hidden dump with:
+  - `seq_len=21`
+  - `hidden=2048`
+  - `HIDDEN 43008 172032`
+- the worker-backed `blk.0 -> blk.1..2` CPU-owned handoff is accepted by:
+  - `qwen36-c-prefix-q8-chain-dynamic`
+- measured on the code-review prompt:
+  - `prefix_seq_worker_ms=1160.39`
+  - `owned_prefix_ms=5581.45`
+
+Interpretation:
+
+- persistent `blk.0` ownership is now integrated into the known-good replay stack
+- `blk.0` is no longer being recomputed by relaunching a one-shot oracle every token
+- the remaining replay cost is still dominated by:
+  - `blk.1..2` replay
+  - `blk.3` full-attention replay
+  - HF tail validation
+
+Sandbox limitation:
+
+- the next validation hop (`qwen36-gpu-full-layer-q8-dynamic` after the worker-backed `blk.1..2` handoff) cannot be validated inside this sandbox because ROCm devices are not visible here
+- direct isolated repro showed:
+  - `qwen36-c-prefix-q8-chain-dynamic` succeeds with worker-produced prefix input
+  - `qwen36-gpu-full-layer-q8-dynamic` fails in sandbox with:
+    - `ds4: ROCm set device failed: no ROCm-capable device is detected`
+
+Current best reading:
+
+- the correct next runtime direction is still:
+  - fixture-backed persistent ownership first
+  - then migrate more replay surfaces into stateful GPU-owned execution
+- the direct-GGUF incremental worker remains a dead branch until its tensor loading contract is repaired
+
+## Persistent `blk.1..2` Chain Worker
+
+We extended the same fixture-backed persistence idea from `blk.0` into the hybrid replay chain.
+
+Current worker capabilities:
+
+- `qwen36-fixture-blk0-worker` now accepts one or more hybrid fixtures
+- commands:
+  - `PREFILL_PREFIX <prefix.bin>`
+  - `STEP <token_id>` for chains whose first owned layer is `blk.0`
+  - `STEP_PREFIX <prefix.bin>` for chains whose input is an upstream hidden-state row
+  - `DUMP_HIDDEN`
+- per-layer retained state:
+  - DeltaNet state
+  - conv ring
+  - expert cache
+
+Harness support:
+
+- `misc/qwen36_hybrid_prefix_tail_greedy.py`
+  - new `--c-bin-worker-bin`
+  - current scope: one hybrid cycle only (`blk.1..2` in front of `blk.3`)
+
+Validated in sandbox on the code-review prompt:
+
+- configuration:
+  - persistent `blk.0` worker
+  - persistent `blk.1..2` worker
+  - HF splice at `blk.2`
+- result:
+  - `prefix_seq_worker_ms=1373.53`
+  - `hybrid_chain_worker_ms=2244.82`
+  - `owned_prefix_ms=3618.35`
+  - `hf_next="the"`
+  - `patched_next="the"`
+  - `argmax_equal=True`
+
+Interpretation:
+
+- `blk.0..2` can now be owned with persistent fixture-backed state instead of replaying those layers from scratch every token
+- the remaining replay cost in this 4-layer slice is now concentrated in:
+  - `blk.3` full-attention ownership
+  - HF tail validation
+
+Important comparison:
+
+- earlier worker-backed `blk.0` plus replayed `blk.1..2` was about `15.4s` owned-prefix time on the same prompt
+- persistent `blk.0..2` is now about `3.6s`
+
+This is the first strong sign that the decode-speed problem was primarily cache/state ownership rather than raw math throughput.
+
+## Persistent `blk.0..3` 4-Step Run
+
+We then ran the real `blk.0..3` path with:
+
+- persistent `blk.0` worker
+- persistent `blk.1..2` worker
+- replayed GPU `blk.3`
+- HF tail validation every step
+
+Prompt:
+
+- `code_review.txt`
+
+Observed behavior:
+
+- all 4 checked decode steps matched the HF reference token
+- first step timings:
+  - `owned_prefix_ms=11151.09`
+  - `prefix_seq_worker_ms=1101.53`
+  - `hybrid_chain_worker_ms=2021.48`
+  - `hf_baseline_ms=68719.36`
+  - `hf_patched_ms=10298.51`
+
+Interpretation:
+
+- the persistent-owned path is now behaving correctly through `blk.3`
+- the remaining owned-path waste is concentrated in `blk.3`, which is still replayed every token
+- the dominant wall in validation is now the HF oracle path, not the owned prefix
+
+Current best next step:
+
+- extend persistence into the full-attention `blk.3 / 7 / 11 / 15` positions
+- after that, widen from the 4-layer slice to the 16-layer owned prefix
