@@ -52,7 +52,7 @@ LLAMA_CPP_INC ?= -I$(LLAMA_CPP_DIR)/include -I$(LLAMA_CPP_DIR)/ggml/include
 LLAMA_CPP_LIBDIR ?= $(LLAMA_CPP_BUILD)/bin
 LLAMA_CPP_LDLIBS ?= -L$(LLAMA_CPP_LIBDIR) -Wl,-rpath,$(LLAMA_CPP_LIBDIR) -lllama -lggml -lm -pthread -ldl
 
-.PHONY: all help clean test cpu cuda cuda-spark cuda-generic cuda-regression strix-halo rocm qwen36-check qwen36-check-q4xl qwen36-check-iq2xxs qwen36-check-v0 qwen36-plan qwen36-runtime-dump qwen36-oracle qwen36-v0-quantize qwen36-v0-quant-lib qwen36-c-moe-replay qwen36-c-linear-replay qwen36-c-linear-conv-replay qwen36-c-linear-core-replay qwen36-c-linear-norm-replay qwen36-c-linear-layer-stub qwen36-c-linear-layer-full qwen36-c-linear-layer-weight qwen36-c-root qwen36-c-root-q8 qwen36-c-decoder-layer qwen36-c-decoder-layer-weight qwen36-c-two-decoder-layers qwen36-c-two-decoder-layers-weight qwen36-c-decoder-chain-weight qwen36-c-prefix-q8-chain-dynamic qwen36-c-full-layer-q8-dynamic qwen36-direct-hybrid-contract-check qwen36-gpu-oracle-scaffold qwen36-gpu-blk0-ffn-q8-oracle qwen36-gpu-blk0-dynamic-q8-oracle qwen36-gpu-hybrid-layer-q8-dynamic qwen36-gpu-prefix-q8-chain-dynamic qwen36-gpu-full-layer-q8-dynamic qwen36-gpu-full-layer-worker qwen36-fixture-blk0-worker
+.PHONY: all help clean test cpu cuda cuda-spark cuda-generic cuda-regression strix-halo rocm qwen36-check qwen36-check-q4xl qwen36-check-iq2xxs qwen36-check-v0 qwen36-plan qwen36-runtime-dump qwen36-oracle qwen36-v0-quantize qwen36-v0-quant-lib qwen36-c-moe-replay qwen36-c-linear-replay qwen36-c-linear-conv-replay qwen36-c-linear-core-replay qwen36-c-linear-norm-replay qwen36-c-linear-layer-stub qwen36-c-linear-layer-full qwen36-c-linear-layer-weight qwen36-c-root qwen36-c-root-q8 qwen36-c-decoder-layer qwen36-c-decoder-layer-weight qwen36-c-two-decoder-layers qwen36-c-two-decoder-layers-weight qwen36-c-decoder-chain-weight qwen36-c-prefix-q8-chain-dynamic qwen36-c-prefix-q8-chain-live qwen36-live-contract-worker qwen36-owned-session-worker qwen36-c-full-layer-q8-dynamic qwen36-direct-hybrid-contract-check qwen36-gpu-oracle-scaffold qwen36-gpu-blk0-ffn-q8-oracle qwen36-gpu-blk0-dynamic-q8-oracle qwen36-gpu-hybrid-layer-q8-dynamic qwen36-gpu-prefix-q8-chain-dynamic qwen36-gpu-full-layer-q8-dynamic qwen36-gpu-full-layer-worker qwen36-fixture-blk0-worker
 
 ifeq ($(UNAME_S),Darwin)
 all: ds4 ds4-server ds4-bench ds4-eval ds4-agent
@@ -134,6 +134,9 @@ help:
 	@echo "  make qwen36-c-two-decoder-layers-weight Build the narrow Qwen3.6 C two-layer weight-driven decoder-chain validator"
 	@echo "  make qwen36-c-decoder-chain-weight Build the narrow Qwen3.6 C generic weight-driven decoder-chain validator"
 	@echo "  make qwen36-c-prefix-q8-chain-dynamic Build the narrow Qwen3.6 dynamic prefix chain for token_embd+blk0..N"
+	@echo "  make qwen36-c-prefix-q8-chain-live Build the prompt-agnostic Qwen3.6 live-contract prefix chain"
+	@echo "  make qwen36-live-contract-worker Build the persistent prompt-agnostic Qwen3.6 live-contract worker"
+	@echo "  make qwen36-owned-session-worker Build the native Qwen3.6 owned-session coordinator"
 	@echo "  make qwen36-c-full-layer-q8-dynamic Build the narrow Qwen3.6 dynamic full-attention+MoE layer runner"
 	@echo "  make qwen36-direct-hybrid-contract-check Compare direct GGUF hybrid tensors against a traced fixture"
 	@echo "  make qwen36-gpu-oracle-scaffold Build the narrow Qwen3.6 HIP/ROCm oracle scaffold"
@@ -446,6 +449,15 @@ qwen36-c-prefix-q8-chain: qwen36_c_prefix_q8_chain_replay.o qwen36_35a3b_q8.o qw
 qwen36-c-prefix-q8-chain-dynamic: qwen36_c_prefix_q8_chain_dynamic.o qwen36_35a3b_q8.o qwen36_gguf.o
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
 
+qwen36-c-prefix-q8-chain-live: qwen36_c_prefix_q8_chain_live.o qwen36_35a3b_q8.o qwen36_gguf.o
+	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
+
+qwen36-live-contract-worker: qwen36_live_contract_worker.o qwen36_35a3b_q8.o qwen36_gguf.o
+	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
+
+qwen36-owned-session-worker: qwen36_owned_session_worker.o
+	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
+
 qwen36-fixture-blk0-worker: qwen36_fixture_blk0_worker.o qwen36_35a3b_q8.o qwen36_gguf.o
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
 
@@ -512,4 +524,4 @@ q4k-dot-test: tests/test_q4k_dot.c
 	./tests/test_q4k_dot
 
 clean:
-	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test ds4_agent_test qwen36-35a3b-q8-check qwen36-35a3b-q4xl-check qwen36-35a3b-iq2xxs-check qwen36-35a3b-v0-check qwen36-plan-dump qwen36-runtime-dump-bin qwen36-v0-quantize-bin qwen36-c-moe-replay qwen36-c-linear-replay qwen36-c-linear-conv-replay qwen36-c-linear-core-replay qwen36-c-linear-norm-replay qwen36-c-linear-layer-stub qwen36-c-linear-layer-full qwen36-c-linear-layer-weight qwen36-c-root qwen36-c-root-q8 qwen36-c-decoder-layer qwen36-c-decoder-layer-weight qwen36-c-two-decoder-layers qwen36-c-two-decoder-layers-weight qwen36-c-decoder-chain-weight qwen36-gpu-full-layer-worker qwen36-fixture-blk0-worker gguf-tools/libds4q.so tests/test_q4k_dot *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o
+	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test ds4_agent_test qwen36-35a3b-q8-check qwen36-35a3b-q4xl-check qwen36-35a3b-iq2xxs-check qwen36-35a3b-v0-check qwen36-plan-dump qwen36-runtime-dump-bin qwen36-v0-quantize-bin qwen36-c-moe-replay qwen36-c-linear-replay qwen36-c-linear-conv-replay qwen36-c-linear-core-replay qwen36-c-linear-norm-replay qwen36-c-linear-layer-stub qwen36-c-linear-layer-full qwen36-c-linear-layer-weight qwen36-c-root qwen36-c-root-q8 qwen36-c-decoder-layer qwen36-c-decoder-layer-weight qwen36-c-two-decoder-layers qwen36-c-two-decoder-layers-weight qwen36-c-decoder-chain-weight qwen36-c-prefix-q8-chain-live qwen36-live-contract-worker qwen36-owned-session-worker qwen36-gpu-full-layer-worker qwen36-fixture-blk0-worker gguf-tools/libds4q.so tests/test_q4k_dot *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o
