@@ -2630,3 +2630,58 @@ Current best next step:
 
 - extend persistence into the full-attention `blk.3 / 7 / 11 / 15` positions
 - after that, widen from the 4-layer slice to the 16-layer owned prefix
+
+## Persistent Full-Attention Worker Wiring
+
+We confirmed that the persistent hybrid reuse was already working and that the remaining owned-path replay was coming from the full-attention positions:
+
+- `blk.3`
+- `blk.7`
+- `blk.11`
+- `blk.15`
+
+Evidence from the 16-layer code-review run:
+
+- first decode step:
+  - `owned_prefix_ms=42723.45`
+  - `prefix_seq_worker_ms=1118.81`
+  - `hybrid_chain_worker_ms_total=9530.96`
+  - `cycle_0_hybrid_worker_ms=2028.04`
+  - `cycle_1_hybrid_worker_ms=2360.05`
+  - `cycle_2_hybrid_worker_ms=2559.43`
+  - `cycle_3_hybrid_worker_ms=2583.44`
+- second decode step:
+  - `owned_prefix_ms=34424.94`
+  - `prefix_seq_worker_ms=38.59`
+  - `hybrid_chain_worker_ms_total=595.66`
+  - `cycle_0_hybrid_worker_ms=267.55`
+  - `cycle_1_hybrid_worker_ms=94.95`
+  - `cycle_2_hybrid_worker_ms=85.40`
+  - `cycle_3_hybrid_worker_ms=147.76`
+
+Interpretation:
+
+- the `blk.0` prefix worker reuse is working
+- the hybrid chain reuse across `blk.1..2`, `blk.4..6`, `blk.8..10`, `blk.12..14` is also working
+- the remaining waste is the per-token replay of the full-attention ownership points
+
+To address that, we added:
+
+- `qwen36-gpu-full-layer-worker`
+  - persistent worker around the proven `qwen36-gpu-full-layer-q8-dynamic` math
+  - protocol:
+    - `PREFILL_SEQ <seq.f32>`
+    - `STEP_ROW <row.f32>`
+    - `DUMP_HIDDEN`
+    - `DUMP_LAST`
+    - `RESET`
+    - `QUIT`
+- harness support in `misc/qwen36_hybrid_prefix_tail_greedy.py`
+  - new `--full-layer-worker-bin`
+  - one persistent worker per full-attention cycle layer
+  - current integration strategy:
+    - prefill from the hybrid-owned sequence on step 0
+    - step from only the new hybrid output row on later decode steps
+    - still dump the full hidden sequence between cycles so the already-proven hybrid workers do not need a protocol change
+
+This is the correct next optimization because it removes the last obvious per-token owned replay without reopening the already-validated hybrid cache path.

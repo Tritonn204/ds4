@@ -59,6 +59,8 @@ typedef struct worker_state {
     layer_runtime *layers;
 } worker_state;
 
+static int run_step_chain_row(worker_state *ws, const qwen36_gguf_file *gf, const float *input_row, char *err, size_t err_cap);
+
 static int read_exact(FILE *fp, void *buf, size_t n) { return fread(buf, 1, n, fp) == n; }
 static int alloc_read_f32(FILE *fp, float **out, size_t count) {
     float *p = (float *)malloc(count * sizeof(float));
@@ -94,6 +96,25 @@ static int prefix_load(const char *path, prefix_fixture *fx) {
         fclose(fp); prefix_free(fx); return 0;
     }
     fclose(fp);
+    return 1;
+}
+
+static int prefix_alloc_seq(prefix_fixture *fx, uint32_t seq_len, uint32_t hidden, int want_token_ids, int want_input_seq) {
+    memset(fx, 0, sizeof(*fx));
+    fx->seq_len = seq_len;
+    fx->hidden = hidden;
+    if (want_token_ids) {
+        fx->token_ids = (uint32_t *)malloc((size_t)seq_len * sizeof(uint32_t));
+        if (!fx->token_ids) return 0;
+    }
+    if (want_input_seq) {
+        fx->input_seq_ref = (float *)malloc((size_t)seq_len * hidden * sizeof(float));
+        if (!fx->input_seq_ref) {
+            free(fx->token_ids);
+            fx->token_ids = NULL;
+            return 0;
+        }
+    }
     return 1;
 }
 
@@ -718,21 +739,25 @@ done:
 }
 
 static int run_step_chain_prefix(worker_state *ws, const qwen36_gguf_file *gf, const prefix_fixture *pfx, char *err, size_t err_cap) {
+    if (pfx->hidden != ws->hidden || pfx->seq_len == 0) {
+        snprintf(err, err_cap, "prefix mismatch");
+        return 0;
+    }
+    return run_step_chain_row(ws, gf, pfx->input_seq_ref + (size_t)(pfx->seq_len - 1u) * ws->hidden, err, err_cap);
+}
+
+static int run_step_chain_row(worker_state *ws, const qwen36_gguf_file *gf, const float *input_row, char *err, size_t err_cap) {
     float *state_row = NULL;
     float *next_row = NULL;
     float *new_seq = NULL;
     int ok = 0;
 
-    if (pfx->hidden != ws->hidden || pfx->seq_len == 0) {
-        snprintf(err, err_cap, "prefix mismatch");
-        return 0;
-    }
     state_row = (float *)malloc((size_t)ws->hidden * sizeof(float));
     if (!state_row) {
         snprintf(err, err_cap, "oom state row");
         return 0;
     }
-    memcpy(state_row, pfx->input_seq_ref + (size_t)(pfx->seq_len - 1u) * ws->hidden, (size_t)ws->hidden * sizeof(float));
+    memcpy(state_row, input_row, (size_t)ws->hidden * sizeof(float));
     for (uint32_t li = 0; li < ws->n_fx; ++li) {
         next_row = (float *)malloc((size_t)ws->hidden * sizeof(float));
         if (!next_row) {
@@ -771,6 +796,86 @@ static void handle_prefill_prefix(worker_state *ws, const qwen36_gguf_file *gf, 
     }
     if (pfx.hidden != ws->hidden) {
         printf("ERROR prefix hidden mismatch\n");
+        fflush(stdout);
+        prefix_free(&pfx);
+        return;
+    }
+    worker_reset(ws);
+    if (!run_prefill_chain(ws, gf, &pfx, err, sizeof(err))) {
+        printf("ERROR %s\n", err[0] ? err : "prefill failed");
+        fflush(stdout);
+        prefix_free(&pfx);
+        return;
+    }
+    printf("PREFILL_OK %u %u\n", ws->seq_len, ws->hidden);
+    fflush(stdout);
+    prefix_free(&pfx);
+}
+
+static void handle_prefill_prefix_bin(worker_state *ws, const qwen36_gguf_file *gf, char *rest) {
+    prefix_fixture pfx;
+    char err[512] = {0};
+    uint32_t seq_len = 0, hidden = 0;
+    if (sscanf(rest ? rest : "", "%u %u", &seq_len, &hidden) != 2) {
+        printf("ERROR bad PREFILL_PREFIX_BIN args\n");
+        fflush(stdout);
+        return;
+    }
+    if (hidden != ws->hidden) {
+        printf("ERROR prefix hidden mismatch\n");
+        fflush(stdout);
+        return;
+    }
+    if (!prefix_alloc_seq(&pfx, seq_len, hidden, 1, 1)) {
+        printf("ERROR oom prefix bin\n");
+        fflush(stdout);
+        return;
+    }
+    if (!read_exact(stdin, pfx.token_ids, (size_t)seq_len * sizeof(uint32_t)) ||
+        !read_exact(stdin, pfx.input_seq_ref, (size_t)seq_len * hidden * sizeof(float))) {
+        printf("ERROR short PREFILL_PREFIX_BIN payload\n");
+        fflush(stdout);
+        prefix_free(&pfx);
+        return;
+    }
+    worker_reset(ws);
+    if (!run_prefill_chain(ws, gf, &pfx, err, sizeof(err))) {
+        printf("ERROR %s\n", err[0] ? err : "prefill failed");
+        fflush(stdout);
+        prefix_free(&pfx);
+        return;
+    }
+    printf("PREFILL_OK %u %u\n", ws->seq_len, ws->hidden);
+    fflush(stdout);
+    prefix_free(&pfx);
+}
+
+static void handle_prefill_seq_bin(worker_state *ws, const qwen36_gguf_file *gf, char *rest) {
+    prefix_fixture pfx;
+    char err[512] = {0};
+    uint32_t seq_len = 0, hidden = 0;
+    if (sscanf(rest ? rest : "", "%u %u", &seq_len, &hidden) != 2) {
+        printf("ERROR bad PREFILL_SEQ_BIN args\n");
+        fflush(stdout);
+        return;
+    }
+    if (hidden != ws->hidden) {
+        printf("ERROR prefix hidden mismatch\n");
+        fflush(stdout);
+        return;
+    }
+    if (ws->fxs[0].layer == 0) {
+        printf("ERROR PREFILL_SEQ_BIN requires non-blk.0 first fixture\n");
+        fflush(stdout);
+        return;
+    }
+    if (!prefix_alloc_seq(&pfx, seq_len, hidden, 0, 1)) {
+        printf("ERROR oom seq bin\n");
+        fflush(stdout);
+        return;
+    }
+    if (!read_exact(stdin, pfx.input_seq_ref, (size_t)seq_len * hidden * sizeof(float))) {
+        printf("ERROR short PREFILL_SEQ_BIN payload\n");
         fflush(stdout);
         prefix_free(&pfx);
         return;
@@ -834,6 +939,43 @@ static void handle_step_prefix(worker_state *ws, const qwen36_gguf_file *gf, con
     prefix_free(&pfx);
 }
 
+static void handle_step_row_bin(worker_state *ws, const qwen36_gguf_file *gf, char *rest) {
+    char err[512] = {0};
+    float *row = NULL;
+    uint32_t hidden = 0;
+    if (!ws->prefilled) {
+        printf("ERROR not prefilled\n");
+        fflush(stdout);
+        return;
+    }
+    if (sscanf(rest ? rest : "", "%u", &hidden) != 1 || hidden != ws->hidden) {
+        printf("ERROR bad STEP_ROW_BIN args\n");
+        fflush(stdout);
+        return;
+    }
+    row = (float *)malloc((size_t)hidden * sizeof(float));
+    if (!row) {
+        printf("ERROR oom step row\n");
+        fflush(stdout);
+        return;
+    }
+    if (!read_exact(stdin, row, (size_t)hidden * sizeof(float))) {
+        printf("ERROR short STEP_ROW_BIN payload\n");
+        fflush(stdout);
+        free(row);
+        return;
+    }
+    if (!run_step_chain_row(ws, gf, row, err, sizeof(err))) {
+        printf("ERROR %s\n", err[0] ? err : "step row failed");
+        fflush(stdout);
+        free(row);
+        return;
+    }
+    printf("STEP_OK %u %u\n", ws->seq_len, ws->hidden);
+    fflush(stdout);
+    free(row);
+}
+
 static void handle_dump_hidden(worker_state *ws) {
     size_t n, bytes;
     if (!ws->prefilled) {
@@ -846,6 +988,18 @@ static void handle_dump_hidden(worker_state *ws) {
     printf("HIDDEN %zu %zu\n", n, bytes);
     fflush(stdout);
     fwrite(ws->output_seq, sizeof(float), n, stdout);
+    fflush(stdout);
+}
+
+static void handle_dump_last(worker_state *ws) {
+    if (!ws->prefilled || ws->seq_len == 0) {
+        printf("ERROR not prefilled\n");
+        fflush(stdout);
+        return;
+    }
+    printf("LAST %u %zu\n", ws->hidden, (size_t)ws->hidden * sizeof(float));
+    fflush(stdout);
+    fwrite(ws->output_seq + (size_t)(ws->seq_len - 1u) * ws->hidden, sizeof(float), ws->hidden, stdout);
     fflush(stdout);
 }
 
@@ -919,12 +1073,20 @@ int main(int argc, char **argv) {
 
         if (strcmp(cmd, "PREFILL_PREFIX") == 0) {
             handle_prefill_prefix(&ws, &gf, rest);
+        } else if (strcmp(cmd, "PREFILL_PREFIX_BIN") == 0) {
+            handle_prefill_prefix_bin(&ws, &gf, rest);
+        } else if (strcmp(cmd, "PREFILL_SEQ_BIN") == 0) {
+            handle_prefill_seq_bin(&ws, &gf, rest);
         } else if (strcmp(cmd, "STEP") == 0) {
             handle_step(&ws, &gf, rest);
         } else if (strcmp(cmd, "STEP_PREFIX") == 0) {
             handle_step_prefix(&ws, &gf, rest);
+        } else if (strcmp(cmd, "STEP_ROW_BIN") == 0) {
+            handle_step_row_bin(&ws, &gf, rest);
         } else if (strcmp(cmd, "DUMP_HIDDEN") == 0) {
             handle_dump_hidden(&ws);
+        } else if (strcmp(cmd, "DUMP_LAST") == 0) {
+            handle_dump_last(&ws);
         } else if (strcmp(cmd, "RESET") == 0) {
             worker_reset(&ws);
             printf("OK\n");
