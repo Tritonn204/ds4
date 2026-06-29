@@ -3,10 +3,538 @@
 ## Current Artifacts
 
 - HF source: `/mnt/e/tensors/Qwen3.6-35B-A3B`
-- Exported experimental GGUF: `/mnt/e/tensors/Qwen3.6-35B-A3B-DS4Style-v0-experimental.gguf`
+- Experimental export artifact: `/mnt/e/tensors/Qwen3.6-35B-A3B-DS4Style-v0-experimental.gguf`
 - Contract checker: `qwen36-35a3b-v0-check`
-- Base Q8 GGUF oracle:
+- Current runtime/oracle Q8 GGUF:
   - `/home/tritonn/.cache/huggingface/hub/models--unsloth--Qwen3.6-35B-A3B-GGUF/snapshots/a483e9e6cbd595906af30beda3187c2663a1118c/Qwen3.6-35B-A3B-Q8_0.gguf`
+
+## Transitional Runtime Contract
+
+The current working runtime path is transitional, not final-form DS4-native execution.
+
+Active provenance sources:
+
+- HF safetensors / HF model directory:
+  - tokenizer
+  - lightweight tail weights under `--splice-layer 39`
+  - prompt-derived prefix/static capture workflows
+- HuggingFace-cache Q8 GGUF:
+  - active executable tensor contract for the current unified runtime
+  - currently bound through `qwen36_35a3b_q8_bind(...)`
+- DS4-side exporter/runtime work:
+  - live contract fixture export
+  - prefix/static fixture export
+  - unified owned-worker architecture
+  - ROCm shortcut/runtime ownership work
+
+Interpretation:
+
+- The DS4 contract and DS4-style runtime ideas are already being exercised.
+- The active executable model contract is still the Q8 runtime GGUF.
+- Direct execution of the experimental DS4 GGUF is not yet the expected behavior of the current runtime surface.
+
+## Fixture Relationships
+
+Two artifact types exist and they are not interchangeable.
+
+- Prefix/static fixture:
+  - produced by `misc/qwen36_c_prefix_fixture_export.py`
+  - prompt-specific
+  - contains prompt token ids plus captured HF layer-0 input sequence
+  - format magic: `Q36PFX01`
+- Live contract fixture:
+  - produced by `misc/qwen36_live_contract_export.py`
+  - prompt-agnostic
+  - contains per-layer hybrid live weights/contract state
+  - format magic: `Q36LCF01`
+
+Path semantics:
+
+- Older composed worker path:
+  - can use a prompt-specific prefix fixture to seed cycle `0`
+  - then carries live owned sequence / final-row data forward cycle by cycle
+- Native owned-session path:
+  - writes only cycle fixture lists into the owned-session config
+  - `qwen36-unified-owned-worker-rocm` loads every listed cycle artifact through `fixture_load(...)`
+  - therefore requires live fixtures for all owned hybrid layers, including `blk0`
+
+This was the key provenance gap in the earlier study text:
+
+- a prompt-specific `blk0` prefix fixture and a live `blk0` fixture occupy similar conceptual positions in the decode graph
+- but they are different artifacts and cannot be substituted silently
+
+## Runtime Provenance Matrix
+
+The orchestration layer supports two materially different fixture-consumption modes.
+
+- Composed Python worker path:
+  - orchestrated through `run_owned_prefix_cycles(...)` in `misc/qwen36_hybrid_prefix_tail_greedy.py`
+  - can use a prompt-specific `blk0.prefix.bin`
+  - cycle `0` may own only two live fixtures when a separate prefix worker seeds the layer-0 input sequence
+  - this is the path where “prefix artifact + later live fixtures” is structurally valid
+- Native owned-session / unified worker path:
+  - orchestrated through `OwnedSession._ensure_workers()` in `misc/qwen36_behavior_oracle.py`
+  - config emitted by `write_owned_session_config(...)`
+  - config contains only `cycle <full_layer> <fixture0,fixture1,...>` lines
+  - the unified C worker then calls `fixture_load(...)` on every listed path
+  - therefore every listed owned hybrid artifact must be `Q36LCF01`, including `blk0.live.bin`
+
+Practical consequence:
+
+- `blk0.prefix.bin` is valid for composed-prefix flows
+- `blk0.live.bin` is required for native owned-session / unified ROCm flows
+- if native owned-session is pointed at a prefix fixture, startup can fail immediately
+- if runtime GGUF and live-fixture family are mixed, startup can succeed while decode semantics collapse
+
+Recommended durable layout:
+
+- `.cache/qwen36_live_contracts/Qwen3.6-35B-A3B-Q8_0/shared/blk0.live.bin`
+- `.cache/qwen36_live_contracts/Qwen3.6-35B-A3B-Q8_0/shared/blk1.live.bin`
+- ...
+- `.cache/qwen36_live_contracts/Qwen3.6-35B-A3B-Q8_0/prompts/code_review/blk0.prefix.bin`
+
+## Restoration Recipe
+
+To restore a known-good transitional runtime setup, regenerate artifacts in two families and do not cross them.
+
+Prompt-specific prefix artifact:
+
+- source:
+  - HF model directory `/mnt/e/tensors/Qwen3.6-35B-A3B`
+- exporter:
+  - `misc/qwen36_c_prefix_fixture_export.py`
+- output family:
+  - `.cache/qwen36_live_contracts/Qwen3.6-35B-A3B-Q8_0/prompts/<prompt_name>/blk0.prefix.bin`
+- purpose:
+  - only for composed prefix-seeding flows
+
+Prompt-agnostic live fixtures:
+
+- source:
+  - active executable runtime GGUF
+  - currently the HuggingFace-cache `Qwen3.6-35B-A3B-Q8_0.gguf`
+- exporter:
+  - `misc/qwen36_live_contract_export.py`
+- output family:
+  - `.cache/qwen36_live_contracts/Qwen3.6-35B-A3B-Q8_0/shared/blk*.live.bin`
+- purpose:
+  - required for native owned-session / unified ROCm runs
+
+Known-good transitional rule:
+
+- HF directory supplies tokenizer, prompt capture, and lightweight splice tail
+- HuggingFace-cache Q8 GGUF supplies the executable runtime contract
+- live fixtures must be regenerated from that same Q8 GGUF
+- DS4 experimental GGUF remains a separate study/export family until the runtime binder is widened
+
+What went wrong during the broken durable-cache phase:
+
+- a `blk0` artifact from one family was treated as if it were from another
+- later layers were mixed across executable-contract families
+- the system therefore moved from:
+  - “startup-valid and semantically coherent”
+  - to
+  - “startup-valid but semantically broken”
+
+That failure mode is now part of the proof, not just an accident:
+
+- artifact provenance is a first-class runtime input
+- correctness depends on family consistency, not only file presence
+
+Operational rule for the current native unified ROCm runtime:
+
+- HF source from `/mnt/e/tensors/Qwen3.6-35B-A3B`
+- runtime GGUF from the HuggingFace-cache `Q8_0.gguf`
+- live fixtures regenerated from that same Q8 GGUF
+- experimental DS4-style GGUF fixtures kept as a separate family until the binder is widened beyond `qwen36_35a3b_q8_bind(...)`
+
+## What Is Proven
+
+High-level:
+
+- DS4-style runtime philosophy already has strong support:
+  - one session timeline
+  - one process
+  - one GPU residency/cache policy
+  - shortcut surfaces that reduce redundant work without obviously destroying semantics
+- DS4-style exported contract artifacts are semantically meaningful enough to drive real runtime shortcuts while remaining compatible with the baseline executable contract during the transitional stage
+
+Low-level:
+
+- unified hybrid execution can reproduce prior worker math in one process
+- unified full-layer ownership can cross the first full-attention boundary faithfully
+- full 40-layer owned sequencing can remain numerically tight under composed calibration
+- native oracle integration works end-to-end
+- hybrid GPU-projection shortcuts produce real decode wins
+- coherent decode in the current runtime requires provenance consistency across:
+  - executable GGUF
+  - live fixture family
+  - orchestration mode
+
+Recent operational evidence:
+
+- clean Q8-aligned durable fixture run:
+  - `/tmp/qwen36_unified_rocm_40layer_q8clean.json`
+  - coherent 32-token decode
+  - generated text continued the expected MoE/router discussion
+  - prefill reached `~= 26.3s`
+  - decode mean reached `~= 505 ms/token`
+  - decode median reached `~= 458 ms/token`
+  - late decode tokens reached `~= 266 .. 294 ms`
+- mixed-family durable fixture run:
+  - `/tmp/qwen36_unified_rocm_40layer_fullcycles.json`
+  - gibberish from step `0`
+  - first generated token already diverged to `_FINE`
+
+Interpretation:
+
+- this confirms the provenance rule operationally, not just structurally
+- mixing DS4-derived live fixtures with the Q8 executable runtime surface can preserve startup while still destroying decode semantics
+- on the clean Q8-aligned path, the unified ROCm runtime is now delivering sustained decode wins, not isolated fast tokens
+
+## What Is Not Yet Proven
+
+- Direct end-to-end execution of the experimental DS4 GGUF in the current runtime
+- A binder/loader surface that can treat the experimental DS4 GGUF as the active executable contract instead of the Q8 GGUF
+
+This is not a failure of the DS4 contract. It is a transitional-stage fact about the current runtime surface.
+
+## Current Velocity
+
+The project is no longer in a “prove one layer in isolation” phase.
+
+It has already crossed into:
+
+- one-process runtime unification
+- full owned 40-layer decode runs
+- real external ROCm speed improvements
+- artifact-discipline lessons that now make rebuilds/restores reproducible
+
+So the present advancement rate is best described as:
+
+- semantic/runtime architecture is advancing quickly
+- executable-contract migration is one major stage behind it
+- decode performance is already in a real optimization regime rather than a rescue/debug regime
+
+## Unified Worker Checkpoint
+
+We now have the first real unified owned-worker compute slice, not just a protocol scaffold.
+
+Binary:
+
+- `qwen36-unified-owned-worker`
+
+Current mode:
+
+- `hybrid_only`
+- one process
+- one GGUF binding
+- flattened live-fixture chain
+- no child-worker handoff
+
+First validated slice:
+
+- `blk.0`
+- `blk.1`
+- `blk.2`
+
+Validation:
+
+- compared against `qwen36-live-contract-worker`
+- same one-token `PREFILL_PREFIX_BIN`
+- same one-token `STEP`
+- compared `DUMP_LAST`
+
+Result:
+
+- `rmse ~= 4.9e-9`
+- `max_abs ~= 5.96e-8`
+- `cos ~= 1.0`
+
+Interpretation:
+
+- the first unified compute migration is numerically faithful
+- the worker-farm removal itself is not changing the blk.0..2 hybrid math
+- we can now extend the unified path upward from a real, calibrated base rather than a protocol-only scaffold
+
+Extended unified hybrid result:
+
+- the unified worker was also compared against `qwen36-live-contract-worker`
+  across the full flattened 30-fixture owned hybrid chain
+- same one-token prefill
+- same one-token decode step
+- compared `DUMP_LAST`
+
+Result:
+
+- `rmse ~= 6.5e-8`
+- `max_abs ~= 7.15e-7`
+- `cos ~= 0.99999994`
+
+Interpretation:
+
+- the entire current owned hybrid side can already be reproduced in one process
+- hybrid unification is not the open risk anymore
+- the next architectural risk moves to the first unified full-attention/GPU slice
+
+## First Unified Full-Attention Boundary
+
+We now also have the first unified full-attention boundary calibrated in-process.
+
+Current mechanism:
+
+- `qwen36-unified-owned-worker`
+- opt-in mode:
+  - `QWEN36_UNIFIED_PREFILL_FULL_CPU=1`
+
+Validated scope:
+
+- hybrid `blk.0..2` prefill in-process
+- full layer `blk.3` prefill in-process
+- hybrid `blk.0..2` incremental step in-process
+- full layer `blk.3` incremental step in-process
+
+Prefill compare:
+
+- unified worker vs:
+  - `qwen36-live-contract-worker` for blk.0..2
+  - then `qwen36-c-full-layer-q8-dynamic --layer 3`
+- result:
+  - `rmse ~= 8.1e-8`
+  - `max_abs ~= 1.43e-6`
+  - `cos ~= 1.0`
+
+Incremental step compare:
+
+- unified worker one-token step vs full recompute oracle
+- result:
+  - `rmse ~= 1.12e-8`
+  - `max_abs ~= 7.45e-8`
+  - `cos ~= 1.0`
+
+Interpretation:
+
+- one-process semantics are now calibrated across the first full-attention boundary
+- the remaining hard problem is backend/residency ownership, not semantic correctness of the unified state machine
+
+## Unified Multi-Cycle Schedule Calibration
+
+The unified worker now has multi-cycle evidence, not just a single boundary proof.
+
+First multi-cycle checkpoint:
+
+- unified schedule:
+  - hybrid `blk.0..2`
+  - full layer `blk.3`
+  - hybrid `blk.4..6`
+  - full layer `blk.7`
+- one-token prefill plus one-token step
+- compared against the composed baseline path
+
+Result:
+
+- `rmse ~= 2.57e-7`
+- `max_abs ~= 7.03e-6`
+- `cos ~= 1.0`
+
+Full 10-cycle checkpoint:
+
+- unified schedule:
+  - all 30 hybrid fixtures in-process
+  - full layers `3, 7, 11, 15, 19, 23, 27, 31, 35, 39`
+- one-token prefill plus one-token step
+- compared final `DUMP_LAST` against the composed baseline
+
+Result:
+
+- `rmse ~= 4.06e-5`
+- `max_abs ~= 8.00e-4`
+- `cos ~= 0.99999988`
+
+Interpretation:
+
+- the flattened one-process owned schedule remains numerically tight even across the full 40-layer path
+- unified sequencing, recurrent state carry, KV carry, and final-row ownership are now sufficiently validated for study purposes
+- this moves the main open question away from semantic correctness and toward backend residency policy:
+  - one ROCm context
+  - one allocation policy
+  - one streaming/cache budget
+  instead of the current worker-farm residency cliff
+
+Oracle-boundary checkpoint:
+
+- `qwen36_behavior_oracle.py` can now drive `qwen36-unified-owned-worker` directly as `--owned-session-worker-bin`
+- explicit flag:
+  - `--owned-session-unified-full-cpu`
+- observed 10-cycle drop-in run:
+  - prefill stayed inside the unified worker
+  - decode stayed inside the unified worker
+  - `owned_step_ms ~= 2231`
+  - generated text remained coherent for the short smoke run:
+    - `"Runtime is"`
+
+Interpretation:
+
+- the unified runtime is no longer only a private harness artifact
+- it already fits the existing oracle/session interface closely enough to be exercised end-to-end
+
+## Unified ROCm Pivot Checkpoint
+
+The next architectural move is now started in code, not just planned.
+
+New integration surface:
+
+- `qwen36-unified-owned-worker-rocm`
+- same unified owned-session envelope
+- same one-process timeline
+- explicit oracle flag:
+  - `--owned-session-unified-full-gpu`
+
+Current scope:
+
+- hybrid fixture layers still run in-process on the existing CPU semantic path
+- owned full-attention layers can now be selected through an in-process ROCm full-layer path in the unified worker
+- ROCm full-layer support is compiled into the unified runtime behind:
+  - `QWEN36_UNIFIED_FULL_GPU=1`
+
+What is proven at this checkpoint:
+
+- the ROCm-capable unified worker target builds successfully
+- the oracle can now pass explicit unified GPU mode through its owned-session env plumbing
+- this is the first build-time elimination step away from the per-layer full-worker farm
+
+What is not yet proven here:
+
+- no trustworthy device-runtime timing in this sandbox
+- no claimed 40-owned residency result yet from the new in-process ROCm path
+
+External ROCm checkpoint on RX 7900 XTX:
+
+- `36-owned` unified run now completes through owned layer `35` in one process
+- owned schedule:
+  - hybrid fixtures `blk.0..2`, `blk.4..6`, ..., `blk.32..34`
+  - in-process ROCm full layers `3, 7, 11, 15, 19, 23, 27, 31, 35`
+- observed prefill:
+  - unified owned prefill `~= 26.6s`
+  - per owned full layer after the first cold load:
+    - roughly `0.21s .. 0.28s`
+- observed decode step:
+  - unified owned decode step `~= 1.08s` at `seq_len=22`
+  - next decode step `~= 0.84s` at `seq_len=23`
+  - owned full GPU layers were typically in the low double-digit milliseconds each
+- user-observed GPU footprint was only about `8 GiB`
+
+## Hybrid GPU-Closure Checkpoint
+
+The unified ROCm path has now crossed a more important threshold than simple projection offload.
+
+Earlier decode shortcut state:
+
+- hybrid GPU-projection cycles moved only selected hybrid projections onto GPU
+- the hybrid FFN/router closure still ran on CPU
+- this produced real wins, but decode still centered in the high hundreds of milliseconds per token
+
+Current decode shortcut state:
+
+- hybrid step scratch is persistent across tokens
+- hybrid `gpu-proj` cycles now also run the hybrid FFN/router closure on GPU through GGUF-backed offsets:
+  - router logits
+  - shared expert gate/up/down
+  - routed expert gate/up/down
+- the DeltaNet / conv recurrent core still remains on CPU
+
+Observed coherent 40-layer run:
+
+- artifact:
+  - `/tmp/qwen36_unified_rocm_40layer_q8clean.json`
+- generated text:
+  - coherent continuation of the MoE/router discussion
+- timings:
+  - `owned_prefill_ms ~= 26343`
+  - `owned_step_ms` mean `~= 505`
+  - `owned_step_ms` median `~= 458`
+  - late owned tokens reached `~= 266 .. 294`
+
+Interpretation:
+
+- the main decode path is now materially GPU-owned beyond the full-attention layers alone
+- the hybrid FFN/router closure was a real remaining bottleneck, and moving it to GPU produced another substantial sustained win
+- the next likely decode bottleneck is the remaining hybrid recurrent core:
+  - DeltaNet update
+  - conv-ring closure
+  - surrounding CPU-side recurrent math
+
+Interpretation:
+
+- this is the first real external evidence that the unified ROCm runtime removes the old worker-farm residency cliff
+- the old 9-worker / 10-worker boundary problem was not an intrinsic cost of "owning more layers"; it was primarily a consequence of duplicating GPU process state and cache policy across many workers
+- the single-process runtime now shows the expected DS4-style property:
+  - per-layer state remains distinct
+  - residency policy is shared
+  - GPU cache growth is global rather than multiplied by worker count
+- this makes the next experiment straightforward:
+  - widen from `36-owned` to `40-owned`
+  - include full layer `39`
+  - use `--splice-layer 39` so the final norm + `lm_head` stay lightweight and in-process
+  - verify that the former 10th-full-layer memory cliff is gone under one ROCm context
+
+Interpretation:
+
+- the work is now aligned with the DS4-style end state:
+  - one process
+  - one session timeline
+  - one GPU context policy
+- remaining work is runtime calibration and progressive replacement of the old worker-farm backend
+
+External ROCm follow-up on RX 7900 XTX:
+
+- `40-owned` unified run now completes through owned layer `39` in one process with:
+  - `--owned-session-unified-full-gpu`
+  - `--splice-layer 39`
+- observed owned schedule:
+  - all 30 hybrid fixtures in-process
+  - in-process ROCm full layers `3, 7, 11, 15, 19, 23, 27, 31, 35, 39`
+- observed baseline:
+  - unified owned prefill `~= 27.0s`
+  - unified owned decode step `~= 0.96s .. 1.04s/token`
+  - full layers already cheap, typically single-digit to low-double-digit milliseconds each
+
+Hybrid GPU-projection follow-up:
+
+- new opt-in control:
+  - `--owned-session-unified-hybrid-gpu-cycles N`
+- current meaning:
+  - convert the first `N` hybrid cycles from CPU-only step math to a mixed path where the hybrid projection slice runs on GPU
+  - recurrent DeltaNet update, conv state handling, router closure, and shared-expert closure remain on CPU
+
+Observed decode results at `seq_len=22`:
+
+- `N = 1`
+  - first converted hybrid layers logged as `[gpu-proj]`
+  - owned decode step stayed around `~= 0.96s`
+  - result proved the hook was live but not yet materially faster
+- `N = 4`
+  - owned decode step dropped to `~= 769.8 ms`
+  - this is a real per-token win of roughly `190 ms`
+- `N = 10`
+  - all 30 hybrid fixture layers logged as `[gpu-proj]`
+  - owned decode step was still `~= 765.4 ms`
+  - this was near-parity with `N = 4` in the short early-decode sample, not another large drop in that particular measurement
+
+Interpretation:
+
+- the projection-only GPU cut is worth keeping
+- it scales enough to remove a meaningful chunk of decode time
+- short early-decode measurements did not show a large additional `4 -> 10` gain, but longer user runs reported token times as low as `~= 300 ms`, so the overall scaling behavior should not yet be described as a settled plateau
+- current evidence is better described as a widespread real win whose magnitude remains prompt/token dependent
+- this still strongly suggests the remaining decode bottleneck is not hybrid projection alone; it is the CPU middle/end of each hybrid layer:
+  - conv/recurrent DeltaNet update
+  - router and expert closure
+  - shared-expert closure
+  - CPU/GPU boundary glue and readback
+- therefore the next optimization target should not be only "push this same projection trick to even more cycles"; it should be:
+  - move more of hybrid step internals onto GPU, especially MoE/shared closure, or
+  - pivot effort from hybrid polishing toward the fuller narrow GPU runtime end state
 
 ## Confirmed Contract Facts
 
@@ -2685,3 +3213,153 @@ To address that, we added:
     - still dump the full hidden sequence between cycles so the already-proven hybrid workers do not need a protocol change
 
 This is the correct next optimization because it removes the last obvious per-token owned replay without reopening the already-validated hybrid cache path.
+
+## 36-Owned vs 40-Owned Residency Cliff
+
+We instrumented the native owned-session coordinator and the persistent full-attention worker directly:
+
+- `qwen36-owned-session-worker`
+  - per-cycle hybrid ms
+  - per-cycle full-layer ms
+  - per-step totals
+- `qwen36-gpu-full-layer-worker`
+  - startup VRAM report via `ds4_gpu_print_memory_report()`
+  - per-step stage timings:
+    - allocation
+    - Q/K/V projection batch
+    - Q/K/V readback
+    - CPU attention
+    - output projection
+    - FFN shared stage
+    - FFN expert loop
+    - KV append
+  - end-of-step VRAM report
+
+### 36-owned reference
+
+Configuration:
+
+- 9 persistent full-attention workers:
+  - `blk.3`
+  - `blk.7`
+  - `blk.11`
+  - `blk.15`
+  - `blk.19`
+  - `blk.23`
+  - `blk.27`
+  - `blk.31`
+  - `blk.35`
+- HF tail still owns `blk.36..39`
+
+Observed steady-state decode:
+
+- `hybrid_ms ~= 730..800 ms` total per token
+- `full_ms ~= 100..135 ms` total per token
+- per full layer step:
+  - generally `5..26 ms`
+
+Interpretation:
+
+- the persistent full-attention worker design is healthy at 9 resident workers
+- hybrid ownership remains the dominant cost in this configuration
+
+### 40-owned full-GPU attempt
+
+Configuration:
+
+- 10 persistent full-attention workers:
+  - `blk.3`
+  - `blk.7`
+  - `blk.11`
+  - `blk.15`
+  - `blk.19`
+  - `blk.23`
+  - `blk.27`
+  - `blk.31`
+  - `blk.35`
+  - `blk.39`
+- lightweight tail only:
+  - final RMS norm + `lm_head`
+
+Observed steady-state decode:
+
+- `hybrid_ms ~= 1.0..1.2 s` total per token
+- `full_ms ~= 12..17 s` total per token
+- per full layer step:
+  - generally `1.0..1.5 s`
+  - with severe outliers:
+    - `blk.31 ~= 3.1 s`
+    - `blk.35 ~= 4.1 s`
+
+### Stage-level diagnosis
+
+The 40-owned slowdown is overwhelmingly concentrated in the first GPU projection batch of the full-layer worker:
+
+- `qkv_gpu_ms` dominates each slow full-layer step
+- `attn_cpu_ms` is negligible
+- `out_proj_ms` is negligible
+- `ffn_shared_*` is negligible
+- `ffn_expert_*` is small relative to the wall time
+
+Representative 40-owned step data:
+
+- `blk.3`
+  - `qkv_gpu_ms=1023.94`
+  - full step total `=1038.82`
+- `blk.31`
+  - `qkv_gpu_ms=3117.29`
+  - full step total `=3130.64`
+- `blk.35`
+  - `qkv_gpu_ms=4099.84`
+  - full step total `=4110.45`
+
+Interpretation:
+
+- the decode cliff is not caused by:
+  - Python dump overhead
+  - hybrid fixture math
+  - CPU-side attention
+  - FFN expert routing
+- the decode cliff is caused by catastrophic slowdown in the full-layer Q/K/V projection stage under the 10-worker resident configuration
+
+### VRAM evidence
+
+Per-worker startup reports on RX 7900 XTX show steady VRAM growth as persistent full workers are added:
+
+- early worker startup:
+  - `used ~= 4.29 GiB`
+- last worker startup:
+  - `used ~= 6.22 GiB`
+
+After decode begins, end-of-step memory reports converge near saturation:
+
+- `used ~= 22.3..22.45 GiB`
+- `free ~= 1.5..1.6 GiB`
+- `total ~= 23.96 GiB`
+
+Interpretation:
+
+- the 10-worker full-ownership configuration pushes the card into a near-full VRAM regime
+- once there, the Q/K/V projection path degrades by roughly two orders of magnitude versus the healthy 9-worker case
+- this is a residency / memory-pressure cliff, not a generic compute regression
+
+### Practical conclusion
+
+The current persistent-per-layer full-attention worker architecture does **not** scale to full 40-layer ownership on RX 7900 XTX.
+
+What works:
+
+- 9 resident full-attention workers + HF tail
+
+What fails:
+
+- 10 resident full-attention workers + lightweight tail
+
+Therefore the correct runtime direction is not "one persistent full worker per owned full-attention layer forever". The runtime needs a global residency strategy, for example:
+
+- one unified owned worker process instead of many child workers
+- a rolling or shared full-attention executor instead of one process per full layer
+- explicit model-range / expert streaming
+- SSD-backed warm caches coordinated at the runtime level rather than by independent worker processes
+
+This result is strong enough to move study emphasis from "prove persistence works" to "design the proper unified runtime and streaming ownership model."
