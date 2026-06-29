@@ -129,6 +129,9 @@ typedef struct layer_step_scratch {
     ds4_gpu_tensor *expert_up_gpu;
     ds4_gpu_tensor *expert_mid_gpu;
     ds4_gpu_tensor *expert_down_gpu;
+    ds4_gpu_tensor *q_gpu;
+    ds4_gpu_tensor *k_gpu;
+    ds4_gpu_tensor *v_gpu;
 #endif
 } layer_step_scratch;
 
@@ -1110,6 +1113,9 @@ static void free_layer_step_scratch(layer_step_scratch *sc) {
     ds4_gpu_tensor_free(sc->shared_gate_gpu);
     ds4_gpu_tensor_free(sc->router_logits_gpu);
     ds4_gpu_tensor_free(sc->post_gpu);
+    ds4_gpu_tensor_free(sc->q_gpu);
+    ds4_gpu_tensor_free(sc->k_gpu);
+    ds4_gpu_tensor_free(sc->v_gpu);
 #endif
     memset(sc, 0, sizeof(*sc));
 }
@@ -1140,9 +1146,13 @@ static int ensure_layer_gpu_step_scratch(const live_fixture *fx, layer_step_scra
     sc->expert_up_gpu = ds4_gpu_tensor_alloc(inter_bytes);
     sc->expert_mid_gpu = ds4_gpu_tensor_alloc(inter_bytes);
     sc->expert_down_gpu = ds4_gpu_tensor_alloc(hidden_bytes);
+    sc->q_gpu = ds4_gpu_tensor_alloc((uint64_t)fx->key_dim * sizeof(float));
+    sc->k_gpu = ds4_gpu_tensor_alloc((uint64_t)fx->key_dim * sizeof(float));
+    sc->v_gpu = ds4_gpu_tensor_alloc((uint64_t)fx->value_dim * sizeof(float));
     if (!sc->input_gpu || !sc->input_ln_gpu || !sc->z_gpu || !sc->a_gpu || !sc->b_gpu || !sc->out_in_gpu || !sc->out_proj_gpu ||
         !sc->post_gpu || !sc->router_logits_gpu || !sc->shared_gate_gpu || !sc->shared_up_gpu || !sc->shared_mid_gpu ||
-        !sc->shared_out_gpu || !sc->expert_gate_gpu || !sc->expert_up_gpu || !sc->expert_mid_gpu || !sc->expert_down_gpu) {
+        !sc->shared_out_gpu || !sc->expert_gate_gpu || !sc->expert_up_gpu || !sc->expert_mid_gpu || !sc->expert_down_gpu ||
+        !sc->q_gpu || !sc->k_gpu || !sc->v_gpu) {
         snprintf(err, err_cap, "gpu tensor alloc failed blk.%u", fx->layer);
         return 0;
     }
@@ -1298,7 +1308,7 @@ static int run_hybrid_layer_step_gpuproj(const live_fixture *fx,
     const uint64_t z_bytes = (uint64_t)fx->value_dim * sizeof(float);
     const uint64_t ab_bytes = (uint64_t)fx->num_v_heads * sizeof(float);
     const uint64_t out_in_bytes = (uint64_t)fx->value_dim * sizeof(float);
-    ds4_gpu_tensor *input_gpu = NULL, *input_ln_gpu = NULL, *z_gpu = NULL, *a_gpu = NULL, *b_gpu = NULL, *out_in_gpu = NULL, *out_proj_gpu = NULL;
+    ds4_gpu_tensor *input_gpu = NULL, *input_ln_gpu = NULL, *z_gpu = NULL, *a_gpu = NULL, *b_gpu = NULL, *out_in_gpu = NULL, *out_proj_gpu = NULL, *q_gpu = NULL, *k_gpu = NULL, *v_gpu = NULL;
     float *qkv_raw = sc->qkv_raw, *qkv = sc->qkv, *z_raw = sc->z_raw, *z = sc->z, *a_raw = sc->a_raw, *a = sc->a, *b_raw = sc->b_raw, *b = sc->b;
     float *conv = sc->conv, *q = sc->q, *k = sc->k, *v = sc->v, *beta = sc->beta, *g = sc->g, *core = sc->core;
     float *out_in = sc->out_in, *out_in_gg = sc->out_in_gg, *out_proj = sc->out_proj, *resid = sc->resid, *post_ln = sc->post_ln, *mlp = sc->mlp;
@@ -1322,6 +1332,9 @@ static int run_hybrid_layer_step_gpuproj(const live_fixture *fx,
     b_gpu = sc->b_gpu;
     out_in_gpu = sc->out_in_gpu;
     out_proj_gpu = sc->out_proj_gpu;
+    q_gpu = sc->q_gpu;
+    k_gpu = sc->k_gpu;
+    v_gpu = sc->v_gpu;
 
     if (ds4_gpu_tensor_write(input_gpu, 0, layer_input, hidden_bytes) == 0) {
         snprintf(err, err_cap, "gpu input write failed blk.%u", fx->layer);
@@ -1347,22 +1360,39 @@ static int run_hybrid_layer_step_gpuproj(const live_fixture *fx,
         goto cleanup;
     }
     if (ds4_gpu_matmul_q8_0_tensor(b_gpu, mf->map, mf->size,
-                                   layer->ssm_beta->abs_offset, fx->hidden, fx->num_v_heads, input_ln_gpu, 1u) == 0) {
+                                    layer->ssm_beta->abs_offset, fx->hidden, fx->num_v_heads, input_ln_gpu, 1u) == 0) {
         snprintf(err, err_cap, "gpu b matmul failed blk.%u", fx->layer);
         goto cleanup;
+    }
+    {
+        const uint64_t row_bytes = (uint64_t)(fx->hidden / 32u) * 34u;
+        const uint64_t q_off = layer->attn_qkv->abs_offset;
+        const uint64_t k_off = q_off + (uint64_t)fx->key_dim * row_bytes;
+        const uint64_t v_off = k_off + (uint64_t)fx->key_dim * row_bytes;
+        if (ds4_gpu_matmul_q8_0_tensor(q_gpu, mf->map, mf->size, q_off, fx->hidden, fx->key_dim, input_ln_gpu, 1u) == 0) {
+            snprintf(err, err_cap, "gpu q matmul failed blk.%u", fx->layer);
+            goto cleanup;
+        }
+        if (ds4_gpu_matmul_q8_0_tensor(k_gpu, mf->map, mf->size, k_off, fx->hidden, fx->key_dim, input_ln_gpu, 1u) == 0) {
+            snprintf(err, err_cap, "gpu k matmul failed blk.%u", fx->layer);
+            goto cleanup;
+        }
+        if (ds4_gpu_matmul_q8_0_tensor(v_gpu, mf->map, mf->size, v_off, fx->hidden, fx->value_dim, input_ln_gpu, 1u) == 0) {
+            snprintf(err, err_cap, "gpu v matmul failed blk.%u", fx->layer);
+            goto cleanup;
+        }
     }
     if (ds4_gpu_end_commands() == 0) {
         snprintf(err, err_cap, "gpu end failed blk.%u", fx->layer);
         goto cleanup;
     }
-    if (!run_gpu_q8_qkv_split_rowwise(mf, layer, fx->hidden, fx->key_dim, fx->value_dim, input_ln_gpu, 1u, qkv_raw)) {
-        snprintf(err, err_cap, "gpu qkv split failed blk.%u", fx->layer);
-        goto cleanup;
-    }
     if (ds4_gpu_tensor_read(z_gpu, 0, z_raw, z_bytes) == 0 ||
         ds4_gpu_tensor_read(a_gpu, 0, a_raw, ab_bytes) == 0 ||
-        ds4_gpu_tensor_read(b_gpu, 0, b_raw, ab_bytes) == 0) {
-        snprintf(err, err_cap, "gpu readback failed blk.%u", fx->layer);
+        ds4_gpu_tensor_read(b_gpu, 0, b_raw, ab_bytes) == 0 ||
+        ds4_gpu_tensor_read(q_gpu, 0, qkv_raw, (uint64_t)fx->key_dim * sizeof(float)) == 0 ||
+        ds4_gpu_tensor_read(k_gpu, 0, qkv_raw + fx->key_dim, (uint64_t)fx->key_dim * sizeof(float)) == 0 ||
+        ds4_gpu_tensor_read(v_gpu, 0, qkv_raw + fx->key_dim * 2u, (uint64_t)fx->value_dim * sizeof(float)) == 0) {
+        snprintf(err, err_cap, "gpu qkv+zab readback failed blk.%u", fx->layer);
         goto cleanup;
     }
 
