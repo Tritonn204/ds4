@@ -212,6 +212,69 @@ __global__ static void kernel_beta_g(
     g[h] = A_log[h] * log1pf(__expf(a_gg[gg] + dt_bias[h]));
 }
 
+__global__ static void kernel_state_norm_silu_reorder(
+        float *out_in_gg,
+        const float *core_hf,
+        const float *z_hf,
+        const float *ssm_norm_w,
+        uint32_t num_v_heads,
+        uint32_t head_v_dim)
+{
+    extern __shared__ float s_red[];
+    const uint32_t gg_head = blockIdx.x;
+    const uint32_t tid = threadIdx.x;
+    const uint32_t half = num_v_heads / 2u;
+    const uint32_t hf_head = (gg_head < half) ? (gg_head * 2u) : ((gg_head - half) * 2u + 1u);
+    const uint32_t src_base = hf_head * head_v_dim;
+    const uint32_t dst_base = gg_head * head_v_dim;
+    float v = 0.0f;
+    if (tid < head_v_dim) {
+        const float cv = core_hf[src_base + tid];
+        v = cv * cv;
+    }
+    s_red[tid] = v;
+    __syncthreads();
+    for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (tid < stride) s_red[tid] += s_red[tid + stride];
+        __syncthreads();
+    }
+    const float inv_rms = rsqrtf(s_red[0] / (float)head_v_dim + 1e-6f);
+    if (tid < head_v_dim) {
+        const float cv = core_hf[src_base + tid];
+        out_in_gg[dst_base + tid] = cv * inv_rms * ssm_norm_w[tid] * (z_hf[src_base + tid] / (1.0f + __expf(-z_hf[src_base + tid])));
+    }
+}
+
+__global__ static void kernel_resid_post_ln(
+        float *resid,
+        float *post_ln,
+        const float *layer_input,
+        const float *out_proj,
+        const float *post_attn_norm_w,
+        uint32_t hidden)
+{
+    extern __shared__ float s_red[];
+    const uint32_t tid = threadIdx.x;
+    float sum = 0.0f;
+    for (uint32_t idx = tid; idx < hidden; idx += blockDim.x) {
+        const float rv = layer_input[idx] + out_proj[idx];
+        resid[idx] = rv;
+        sum += rv * rv;
+    }
+    s_red[tid] = sum;
+    __syncthreads();
+    for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (tid < stride) s_red[tid] += s_red[tid + stride];
+        __syncthreads();
+    }
+    if (tid == 0) s_red[0] /= (float)hidden;
+    __syncthreads();
+    const float inv_rms = rsqrtf(s_red[0] + 1e-6f);
+    for (uint32_t idx = tid; idx < hidden; idx += blockDim.x) {
+        post_ln[idx] = resid[idx] * inv_rms * post_attn_norm_w[idx];
+    }
+}
+
 /*
  * ds4_gpu_fused_reorder_conv_tensor — GPU implementation
  *
@@ -379,41 +442,26 @@ int ds4_gpu_state_norm_silu_reorder_tensor(
         const float *ssm_norm_w)
 {
     const uint64_t vdim_bytes = (uint64_t)num_v_heads * head_v_dim * sizeof(float);
-    uint32_t h, vd;
-
-    float *core = (float *)malloc(vdim_bytes);
-    float *z_hf = (float *)malloc(vdim_bytes);
-    float *out_in_hf = (float *)malloc(vdim_bytes);
-    float *out_in_gg = (float *)malloc(vdim_bytes);
-    if (!core || !z_hf || !out_in_hf || !out_in_gg) goto cleanup;
-
-    if (ds4_gpu_tensor_read(core_gpu, 0, core, vdim_bytes) == 0 ||
-        ds4_gpu_tensor_read(z_gpu, 0, z_hf, vdim_bytes) == 0)
-        goto cleanup;
-
-    for (h = 0; h < num_v_heads; ++h) {
-        size_t base = (size_t)h * head_v_dim;
-        double var = 0.0;
-        for (vd = 0; vd < head_v_dim; ++vd) {
-            double cv = core[base + vd];
-            var += cv * cv;
-        }
-        var /= (double)head_v_dim;
-        for (vd = 0; vd < head_v_dim; ++vd) {
-            float cv = core[base + vd];
-            out_in_hf[base + vd] = (float)(cv / sqrt(var + 1e-6)) * ssm_norm_w[vd] * stub_silu(z_hf[base + vd]);
-        }
+    ds4_gpu_tensor *ssm_norm_w_gpu = ds4_gpu_tensor_alloc((uint64_t)head_v_dim * sizeof(float));
+    float *out_ptr = NULL, *core_ptr = NULL, *z_ptr = NULL, *norm_ptr = NULL;
+    if (!ssm_norm_w_gpu) return 0;
+    if (ds4_gpu_tensor_write(ssm_norm_w_gpu, 0, ssm_norm_w, (uint64_t)head_v_dim * sizeof(float)) == 0) {
+        ds4_gpu_tensor_free(ssm_norm_w_gpu);
+        return 0;
     }
-
-    stub_reorder_out_in_hftogg(out_in_gg, out_in_hf, num_v_heads, head_v_dim);
-
-    if (ds4_gpu_tensor_write(out_in_gg_gpu, 0, out_in_gg, vdim_bytes) == 0) goto cleanup;
-
-    free(core); free(z_hf); free(out_in_hf); free(out_in_gg);
+    out_ptr = (float *)ds4_gpu_tensor_contents(out_in_gg_gpu);
+    core_ptr = (float *)ds4_gpu_tensor_contents((ds4_gpu_tensor *)core_gpu);
+    z_ptr = (float *)ds4_gpu_tensor_contents((ds4_gpu_tensor *)z_gpu);
+    norm_ptr = (float *)ds4_gpu_tensor_contents(ssm_norm_w_gpu);
+    if (!out_ptr || !core_ptr || !z_ptr || !norm_ptr) {
+        ds4_gpu_tensor_free(ssm_norm_w_gpu);
+        return 0;
+    }
+    kernel_state_norm_silu_reorder<<<num_v_heads, head_v_dim, head_v_dim * sizeof(float)>>>(
+        out_ptr, core_ptr, z_ptr, norm_ptr, num_v_heads, head_v_dim);
+    ds4_gpu_tensor_free(ssm_norm_w_gpu);
+    (void)vdim_bytes;
     return 1;
-cleanup:
-    free(core); free(z_hf); free(out_in_hf); free(out_in_gg);
-    return 0;
 }
 
 /*
@@ -432,35 +480,27 @@ int ds4_gpu_resid_post_ln_tensor(
         uint32_t hidden,
         const float *post_attn_norm_w)
 {
-    const uint64_t hidden_bytes = (uint64_t)hidden * sizeof(float);
-    uint32_t d;
-
-    float *layer_input = (float *)malloc(hidden_bytes);
-    float *out_proj = (float *)malloc(hidden_bytes);
-    float *resid = (float *)malloc(hidden_bytes);
-    float *post_ln = (float *)malloc(hidden_bytes);
-    if (!layer_input || !out_proj || !resid || !post_ln) goto cleanup;
-
-    if (ds4_gpu_tensor_read(layer_input_gpu, 0, layer_input, hidden_bytes) == 0 ||
-        ds4_gpu_tensor_read(out_proj_gpu, 0, out_proj, hidden_bytes) == 0)
-        goto cleanup;
-
-    {
-        double var = 0.0;
-        for (d = 0; d < hidden; ++d) { resid[d] = layer_input[d] + out_proj[d]; var += (double)resid[d] * resid[d]; }
-        var /= (double)hidden;
-        for (d = 0; d < hidden; ++d) post_ln[d] = (float)(resid[d] / sqrt(var + 1e-6)) * post_attn_norm_w[d];
+    ds4_gpu_tensor *post_attn_norm_w_gpu = ds4_gpu_tensor_alloc((uint64_t)hidden * sizeof(float));
+    float *resid_ptr = NULL, *post_ptr = NULL, *in_ptr = NULL, *proj_ptr = NULL, *w_ptr = NULL;
+    const uint32_t block = 256u;
+    if (!post_attn_norm_w_gpu) return 0;
+    if (ds4_gpu_tensor_write(post_attn_norm_w_gpu, 0, post_attn_norm_w, (uint64_t)hidden * sizeof(float)) == 0) {
+        ds4_gpu_tensor_free(post_attn_norm_w_gpu);
+        return 0;
     }
-
-    if (ds4_gpu_tensor_write(resid_gpu, 0, resid, hidden_bytes) == 0 ||
-        ds4_gpu_tensor_write(post_ln_gpu, 0, post_ln, hidden_bytes) == 0)
-        goto cleanup;
-
-    free(layer_input); free(out_proj); free(resid); free(post_ln);
+    resid_ptr = (float *)ds4_gpu_tensor_contents(resid_gpu);
+    post_ptr = (float *)ds4_gpu_tensor_contents(post_ln_gpu);
+    in_ptr = (float *)ds4_gpu_tensor_contents((ds4_gpu_tensor *)layer_input_gpu);
+    proj_ptr = (float *)ds4_gpu_tensor_contents((ds4_gpu_tensor *)out_proj_gpu);
+    w_ptr = (float *)ds4_gpu_tensor_contents(post_attn_norm_w_gpu);
+    if (!resid_ptr || !post_ptr || !in_ptr || !proj_ptr || !w_ptr) {
+        ds4_gpu_tensor_free(post_attn_norm_w_gpu);
+        return 0;
+    }
+    kernel_resid_post_ln<<<1u, block, block * sizeof(float)>>>(
+        resid_ptr, post_ptr, in_ptr, proj_ptr, w_ptr, hidden);
+    ds4_gpu_tensor_free(post_attn_norm_w_gpu);
     return 1;
-cleanup:
-    free(layer_input); free(out_proj); free(resid); free(post_ln);
-    return 0;
 }
 
 /*
