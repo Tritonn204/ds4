@@ -136,6 +136,8 @@ typedef struct layer_step_scratch {
 } layer_step_scratch;
 
 typedef struct unified_session_state unified_session_state;
+typedef struct mapped_file mapped_file;
+typedef struct layer_runtime layer_runtime;
 
 static int read_f32_tensor(const qwen36_gguf_file *gf, const qwen36_gguf_tensor *t, float **out, size_t elems, char *err, size_t err_cap);
 static double now_ms(void);
@@ -162,6 +164,15 @@ static void run_deltanet_head_step(float *state,
                                    float *q_scaled,
                                    float *delta_tmp,
                                    float *out_row);
+static int run_hybrid_layer_step_gpuproj(const live_fixture *fx,
+                                         const qwen36_gguf_file *gf,
+                                         const qwen36_35a3b_q8_layer *layer,
+                                         const mapped_file *mf,
+                                         layer_runtime *ls,
+                                         const float *layer_input,
+                                         float *out_row,
+                                         char *err,
+                                         size_t err_cap);
 static int alloc_layer_step_scratch(const live_fixture *fx, layer_step_scratch *sc, char *err, size_t err_cap);
 static void free_layer_step_scratch(layer_step_scratch *sc);
 #ifdef QWEN36_UNIFIED_HAVE_GPU
