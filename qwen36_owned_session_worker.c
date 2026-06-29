@@ -4,6 +4,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -81,6 +82,12 @@ static int write_all(int fd, const void *buf, size_t n) {
     return 1;
 }
 
+static double now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1000000.0;
+}
+
 static int read_all(int fd, void *buf, size_t n) {
     uint8_t *p = (uint8_t *)buf;
     while (n > 0) {
@@ -133,6 +140,16 @@ static void read_fd_available(int fd, char *buf, size_t cap) {
     }
     buf[pos] = '\0';
     (void)fcntl(fd, F_SETFL, flags);
+}
+
+static void child_drain_logs(child_proc *cp) {
+    char buf[4096];
+    if (!cp || cp->err_fd < 0) return;
+    read_fd_available(cp->err_fd, buf, sizeof(buf));
+    if (buf[0] != '\0') {
+        fputs(buf, stderr);
+        fflush(stderr);
+    }
 }
 
 static char *xstrdup_local(const char *s) {
@@ -633,10 +650,14 @@ static int session_step(session_state *st, uint32_t token_id, char *err, size_t 
     float *row = NULL;
     float *tmp_row = NULL;
     uint32_t first_layer = 0;
+    double step_t0 = 0.0;
+    double hybrid_total_ms = 0.0;
+    double full_total_ms = 0.0;
     if (st->seq_len == 0 || st->hidden == 0) {
         snprintf(err, err_cap, "not prefilled");
         return 0;
     }
+    step_t0 = now_ms();
     row = (float *)malloc((size_t)st->hidden * sizeof(float));
     tmp_row = (float *)malloc((size_t)st->hidden * sizeof(float));
     new_owned = (float *)realloc(st->owned_seq, (size_t)(st->seq_len + 1) * st->hidden * sizeof(float));
@@ -651,6 +672,7 @@ static int session_step(session_state *st, uint32_t token_id, char *err, size_t 
     st->token_ids[st->seq_len] = token_id;
 
     if (st->prefix_worker_live) {
+        double prefix_t0 = now_ms();
         fprintf(stderr, "step prefix next_token=%u seq_len=%u\n", token_id, st->seq_len + 1u);
         fflush(stderr);
         if (!child_step_token(&st->prefix_worker, token_id, err, err_cap) ||
@@ -659,17 +681,25 @@ static int session_step(session_state *st, uint32_t token_id, char *err, size_t 
             free(tmp_row);
             return 0;
         }
+        child_drain_logs(&st->prefix_worker);
+        fprintf(stderr, "step prefix ms=%.2f\n", now_ms() - prefix_t0);
+        fflush(stderr);
     }
     for (i = 0; i < st->cfg.n_cycles; ++i) {
         cycle_config *cy = &st->cfg.cycles[i];
         child_proc *hy = &st->hybrid_workers[i];
         child_proc *fw = &st->full_workers[i];
+        double hybrid_t0 = 0.0;
+        double full_t0 = 0.0;
+        double hybrid_ms = 0.0;
+        double full_ms = 0.0;
         if (!read_fixture_layer(cy->fixtures[0], &first_layer)) {
             snprintf(err, err_cap, "failed to read fixture header");
             free(row);
             free(tmp_row);
             return 0;
         }
+        hybrid_t0 = now_ms();
         if (i == 0 && !st->prefix_worker_live && first_layer == 0) {
             fprintf(stderr, "step cycle=%u hybrid owns blk0 token=%u\n", i, token_id);
             fflush(stderr);
@@ -690,6 +720,12 @@ static int session_step(session_state *st, uint32_t token_id, char *err, size_t 
             }
             memcpy(row, tmp_row, (size_t)st->hidden * sizeof(float));
         }
+        child_drain_logs(hy);
+        hybrid_ms = now_ms() - hybrid_t0;
+        hybrid_total_ms += hybrid_ms;
+        fprintf(stderr, "step cycle=%u hybrid ms=%.2f\n", i, hybrid_ms);
+        fflush(stderr);
+        full_t0 = now_ms();
         fprintf(stderr, "step cycle=%u full layer=%u\n", i, cy->full_layer);
         fflush(stderr);
         if (!child_step_row_bin(fw, row, st->hidden, err, err_cap) ||
@@ -698,10 +734,18 @@ static int session_step(session_state *st, uint32_t token_id, char *err, size_t 
             free(tmp_row);
             return 0;
         }
+        child_drain_logs(fw);
+        full_ms = now_ms() - full_t0;
+        full_total_ms += full_ms;
+        fprintf(stderr, "step cycle=%u full ms=%.2f\n", i, full_ms);
+        fflush(stderr);
         memcpy(row, tmp_row, (size_t)st->hidden * sizeof(float));
     }
     memcpy(st->owned_seq + (size_t)st->seq_len * st->hidden, row, (size_t)st->hidden * sizeof(float));
     st->seq_len += 1;
+    fprintf(stderr, "step totals hybrid_ms=%.2f full_ms=%.2f total_ms=%.2f\n",
+            hybrid_total_ms, full_total_ms, now_ms() - step_t0);
+    fflush(stderr);
     free(row);
     free(tmp_row);
     return 1;

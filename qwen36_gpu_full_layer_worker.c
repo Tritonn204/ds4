@@ -8,6 +8,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -48,6 +49,23 @@ typedef struct worker_state {
     float *v_all;
     float *output_seq;
 } worker_state;
+
+typedef struct full_ffn_timing {
+    double alloc_ms;
+    double shared_gpu_ms;
+    double shared_readback_ms;
+    double route_ms;
+    double expert_gpu_ms;
+    double expert_readback_ms;
+    double combine_ms;
+    uint32_t n_union;
+} full_ffn_timing;
+
+static double now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1000000.0;
+}
 
 static int mapped_file_open(mapped_file *mf, const char *path) {
     struct stat st;
@@ -219,7 +237,8 @@ static int run_gpu_ffn_from_residual(
         const float *shared_gate_inp_w,
         uint32_t n_tokens,
         const float *residual_in,
-        float *out_seq) {
+        float *out_seq,
+        full_ffn_timing *timing) {
     const uint32_t hidden = HIDDEN;
     const uint32_t topk = 8u;
     const uint32_t shared_dim = INTER;
@@ -240,6 +259,7 @@ static int run_gpu_ffn_from_residual(
     int32_t union_pos[ROUTER_COUNT];
     uint32_t n_union = 0;
     int ok = 0;
+    double t0 = now_ms();
 
     residual = ds4_gpu_tensor_alloc(seq_hidden_bytes);
     post = ds4_gpu_tensor_alloc(seq_hidden_bytes);
@@ -254,7 +274,9 @@ static int run_gpu_ffn_from_residual(
     expert_down = ds4_gpu_tensor_alloc(seq_hidden_bytes);
     if (!residual || !post || !router_logits || !shared_gate || !shared_up || !shared_mid || !shared_out ||
         !expert_gate || !expert_up || !expert_mid || !expert_down) goto cleanup;
+    if (timing) timing->alloc_ms = now_ms() - t0;
 
+    t0 = now_ms();
     if (ds4_gpu_tensor_write(residual, 0, residual_in, seq_hidden_bytes) == 0) goto cleanup;
     if (ds4_gpu_begin_commands() == 0) goto cleanup;
     if (ds4_gpu_rms_norm_weight_rows_tensor(post, residual, mf->map, mf->size,
@@ -273,7 +295,9 @@ static int run_gpu_ffn_from_residual(
                                    layer->ffn_down_shexp->abs_offset,
                                    shared_dim, hidden, shared_mid, n_tokens) == 0) goto cleanup;
     if (ds4_gpu_end_commands() == 0) goto cleanup;
+    if (timing) timing->shared_gpu_ms = now_ms() - t0;
 
+    t0 = now_ms();
     router_logits_cpu = (float *)malloc(router_logits_bytes);
     shared_out_cpu = (float *)malloc(seq_hidden_bytes);
     expert_down_cpu = (float *)malloc(seq_hidden_bytes);
@@ -287,7 +311,9 @@ static int run_gpu_ffn_from_residual(
     if (ds4_gpu_tensor_read(router_logits, 0, router_logits_cpu, router_logits_bytes) == 0) goto cleanup;
     if (ds4_gpu_tensor_read(shared_out, 0, shared_out_cpu, seq_hidden_bytes) == 0) goto cleanup;
     if (ds4_gpu_tensor_read(post, 0, post_cpu, seq_hidden_bytes) == 0) goto cleanup;
+    if (timing) timing->shared_readback_ms = now_ms() - t0;
 
+    t0 = now_ms();
     for (uint32_t t = 0; t < n_tokens; ++t) {
         topk_softmax256(router_logits_cpu + (size_t)t * ROUTER_COUNT, topk,
                         router_selected_cpu + (size_t)t * topk,
@@ -300,9 +326,15 @@ static int run_gpu_ffn_from_residual(
             }
         }
     }
+    if (timing) {
+        timing->route_ms = now_ms() - t0;
+        timing->n_union = n_union;
+    }
 
+    t0 = now_ms();
     for (uint32_t u = 0; u < n_union; ++u) {
         const uint32_t expert_id = (uint32_t)union_ids[u];
+        double expert_t0 = now_ms();
         if (ds4_gpu_begin_commands() == 0) goto cleanup;
         if (ds4_gpu_matmul_q8_0_pair_tensor(expert_gate, expert_up,
                                             mf->map, mf->size,
@@ -315,7 +347,10 @@ static int run_gpu_ffn_from_residual(
                                        layer->ffn_down_exps->abs_offset + down_expert_bytes * expert_id,
                                        shared_dim, hidden, expert_mid, n_tokens) == 0) goto cleanup;
         if (ds4_gpu_end_commands() == 0) goto cleanup;
+        if (timing) timing->expert_gpu_ms += now_ms() - expert_t0;
+        expert_t0 = now_ms();
         if (ds4_gpu_tensor_read(expert_down, 0, expert_down_cpu, seq_hidden_bytes) == 0) goto cleanup;
+        if (timing) timing->expert_readback_ms += now_ms() - expert_t0;
         for (uint32_t t = 0; t < n_tokens; ++t) {
             float weight = 0.0f;
             for (uint32_t i = 0; i < topk; ++i) {
@@ -333,6 +368,7 @@ static int run_gpu_ffn_from_residual(
         }
     }
 
+    t0 = now_ms();
     for (uint32_t t = 0; t < n_tokens; ++t) {
         float scale_in = 0.0f;
         for (uint32_t d = 0; d < hidden; ++d) scale_in += post_cpu[(size_t)t * hidden + d] * shared_gate_inp_w[d];
@@ -344,6 +380,7 @@ static int run_gpu_ffn_from_residual(
             }
         }
     }
+    if (timing) timing->combine_ms = now_ms() - t0;
     ok = 1;
 
 cleanup:
@@ -555,7 +592,7 @@ static int run_prefill_full_layer(worker_state *ws, const float *input_seq, uint
             residual[idx] = input_seq[idx] + proj_out[idx];
         }
     }
-    if (!run_gpu_ffn_from_residual(&ws->mf, ws->layer, ws->cache.shared_gate_inp_w, seq_len, residual, output_seq)) goto cleanup;
+    if (!run_gpu_ffn_from_residual(&ws->mf, ws->layer, ws->cache.shared_gate_inp_w, seq_len, residual, output_seq, NULL)) goto cleanup;
 
     free(ws->k_all); ws->k_all = k_all; k_all = NULL;
     free(ws->v_all); ws->v_all = v_all; v_all = NULL;
@@ -591,7 +628,14 @@ static int run_step_full_layer(worker_state *ws, const float *input_row) {
     float *new_k = NULL, *new_v = NULL, *new_out = NULL;
     uint32_t pos = ws->seq_len;
     int ok = 0;
+    full_ffn_timing ffn_timing;
+    double step_t0 = now_ms();
+    double alloc_ms = 0.0, qkv_gpu_ms = 0.0, qkv_readback_ms = 0.0;
+    double attn_cpu_ms = 0.0, out_proj_ms = 0.0, kv_append_ms = 0.0;
 
+    memset(&ffn_timing, 0, sizeof(ffn_timing));
+
+    step_t0 = now_ms();
     attn_in = (float *)malloc((size_t)HIDDEN * sizeof(float));
     qg = (float *)malloc((size_t)ATTN_GATE_DIM * 2u * sizeof(float));
     kk = (float *)malloc((size_t)NUM_KV_HEADS * HEAD_DIM * sizeof(float));
@@ -606,7 +650,9 @@ static int run_step_full_layer(worker_state *ws, const float *input_row) {
     attn_out_gpu = ds4_gpu_tensor_alloc((uint64_t)ATTN_GATE_DIM * sizeof(float));
     proj_out_gpu = ds4_gpu_tensor_alloc((uint64_t)HIDDEN * sizeof(float));
     if (!input_gpu || !attn_in_gpu || !qg_gpu || !k_gpu || !v_gpu || !attn_out_gpu || !proj_out_gpu) goto cleanup;
+    alloc_ms = now_ms() - step_t0;
 
+    step_t0 = now_ms();
     if (ds4_gpu_tensor_write(input_gpu, 0, input_row, (uint64_t)HIDDEN * sizeof(float)) == 0) goto cleanup;
     if (ds4_gpu_begin_commands() == 0) goto cleanup;
     if (ds4_gpu_rms_norm_weight_rows_tensor(attn_in_gpu, input_gpu, ws->mf.map, ws->mf.size,
@@ -618,12 +664,16 @@ static int run_step_full_layer(worker_state *ws, const float *input_row) {
     if (ds4_gpu_matmul_q8_0_tensor(v_gpu, ws->mf.map, ws->mf.size,
                                    ws->layer->attn_v->abs_offset, HIDDEN, NUM_KV_HEADS * HEAD_DIM, attn_in_gpu, 1u) == 0) goto cleanup;
     if (ds4_gpu_end_commands() == 0) goto cleanup;
+    qkv_gpu_ms = now_ms() - step_t0;
 
+    step_t0 = now_ms();
     if (ds4_gpu_tensor_read(attn_in_gpu, 0, attn_in, (uint64_t)HIDDEN * sizeof(float)) == 0) goto cleanup;
     if (ds4_gpu_tensor_read(qg_gpu, 0, qg, (uint64_t)ATTN_GATE_DIM * 2u * sizeof(float)) == 0) goto cleanup;
     if (ds4_gpu_tensor_read(k_gpu, 0, kk, (uint64_t)NUM_KV_HEADS * HEAD_DIM * sizeof(float)) == 0) goto cleanup;
     if (ds4_gpu_tensor_read(v_gpu, 0, vv, (uint64_t)NUM_KV_HEADS * HEAD_DIM * sizeof(float)) == 0) goto cleanup;
+    qkv_readback_ms = now_ms() - step_t0;
 
+    step_t0 = now_ms();
     for (uint32_t h = 0; h < NUM_HEADS; ++h) {
         const float *src = qg + (size_t)h * (HEAD_DIM * 2u);
         float *qdst = q_cur + (size_t)h * HEAD_DIM;
@@ -662,17 +712,21 @@ static int run_step_full_layer(worker_state *ws, const float *input_row) {
         }
         for (uint32_t d = 0; d < HEAD_DIM; ++d) out[d] *= sigmoidf_local(gate_cur[(size_t)h * HEAD_DIM + d]);
     }
+    attn_cpu_ms = now_ms() - step_t0;
 
+    step_t0 = now_ms();
     if (ds4_gpu_tensor_write(attn_out_gpu, 0, attn_out_flat, (uint64_t)ATTN_GATE_DIM * sizeof(float)) == 0) goto cleanup;
     if (ds4_gpu_begin_commands() == 0) goto cleanup;
     if (ds4_gpu_matmul_q8_0_tensor(proj_out_gpu, ws->mf.map, ws->mf.size,
                                    ws->layer->attn_output->abs_offset, ATTN_GATE_DIM, HIDDEN, attn_out_gpu, 1u) == 0) goto cleanup;
     if (ds4_gpu_end_commands() == 0) goto cleanup;
     if (ds4_gpu_tensor_read(proj_out_gpu, 0, proj_out, (uint64_t)HIDDEN * sizeof(float)) == 0) goto cleanup;
+    out_proj_ms = now_ms() - step_t0;
 
     for (uint32_t d = 0; d < HIDDEN; ++d) residual[d] = input_row[d] + proj_out[d];
-    if (!run_gpu_ffn_from_residual(&ws->mf, ws->layer, ws->cache.shared_gate_inp_w, 1u, residual, output_row)) goto cleanup;
+    if (!run_gpu_ffn_from_residual(&ws->mf, ws->layer, ws->cache.shared_gate_inp_w, 1u, residual, output_row, &ffn_timing)) goto cleanup;
 
+    step_t0 = now_ms();
     new_k = (float *)realloc(ws->k_all, (size_t)(pos + 1u) * NUM_KV_HEADS * HEAD_DIM * sizeof(float));
     new_v = (float *)realloc(ws->v_all, (size_t)(pos + 1u) * NUM_KV_HEADS * HEAD_DIM * sizeof(float));
     new_out = (float *)realloc(ws->output_seq, (size_t)(pos + 1u) * HIDDEN * sizeof(float));
@@ -684,6 +738,23 @@ static int run_step_full_layer(worker_state *ws, const float *input_row) {
     memcpy(ws->v_all + (size_t)pos * NUM_KV_HEADS * HEAD_DIM, v_cur, sizeof(v_cur));
     memcpy(ws->output_seq + (size_t)pos * HIDDEN, output_row, sizeof(output_row));
     ws->seq_len = pos + 1u;
+    kv_append_ms = now_ms() - step_t0;
+    fprintf(stderr,
+            "qwen36_full layer=%u seq=%u alloc_ms=%.2f qkv_gpu_ms=%.2f qkv_readback_ms=%.2f "
+            "attn_cpu_ms=%.2f out_proj_ms=%.2f ffn_alloc_ms=%.2f ffn_shared_gpu_ms=%.2f "
+            "ffn_shared_readback_ms=%.2f ffn_route_ms=%.2f ffn_expert_gpu_ms=%.2f "
+            "ffn_expert_readback_ms=%.2f ffn_combine_ms=%.2f ffn_union=%u kv_append_ms=%.2f total_ms=%.2f\n",
+            ws->layer_idx, ws->seq_len,
+            alloc_ms, qkv_gpu_ms, qkv_readback_ms,
+            attn_cpu_ms, out_proj_ms, ffn_timing.alloc_ms, ffn_timing.shared_gpu_ms,
+            ffn_timing.shared_readback_ms, ffn_timing.route_ms, ffn_timing.expert_gpu_ms,
+            ffn_timing.expert_readback_ms, ffn_timing.combine_ms, ffn_timing.n_union,
+            kv_append_ms,
+            alloc_ms + qkv_gpu_ms + qkv_readback_ms + attn_cpu_ms + out_proj_ms +
+            ffn_timing.alloc_ms + ffn_timing.shared_gpu_ms + ffn_timing.shared_readback_ms +
+            ffn_timing.route_ms + ffn_timing.expert_gpu_ms + ffn_timing.expert_readback_ms +
+            ffn_timing.combine_ms + kv_append_ms);
+    ds4_gpu_print_memory_report("full_step_end");
     ok = 1;
 
 cleanup:
@@ -879,6 +950,8 @@ int main(int argc, char **argv) {
     }
     (void)ds4_gpu_set_model_map(ws.mf.map, ws.mf.size);
     (void)ds4_gpu_set_model_fd_for_map(ws.mf.fd, ws.mf.map);
+    fprintf(stderr, "qwen36_full layer=%u startup\n", ws.layer_idx);
+    ds4_gpu_print_memory_report("full_worker_ready");
 
     printf("READY\n");
     fflush(stdout);
