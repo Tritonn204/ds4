@@ -8,6 +8,70 @@
 #define DS4_ROCM_ATTENTION_INDEXED_SCORE_CAP \
     (256u + DS4_ROCM_ATTENTION_INDEXED_TOPK_CAP)
 
+__global__ static void attention_decode_qwen_gqa_kernel(
+        float *heads,
+        const float *q,
+        const float *k_cache,
+        const float *v_cache,
+        uint32_t seq_len,
+        uint32_t n_q_head,
+        uint32_t n_kv_head,
+        uint32_t head_dim) {
+    const uint32_t h = (uint32_t)blockIdx.x;
+    const uint32_t tid = threadIdx.x;
+    if (h >= n_q_head || seq_len == 0u || n_kv_head == 0u) return;
+    const uint32_t kv_group = n_q_head / n_kv_head;
+    const uint32_t kvh = kv_group ? (h / kv_group) : 0u;
+    const float *qh = q + (uint64_t)h * head_dim;
+    __shared__ float scores[8192];
+    __shared__ float partial[256];
+    __shared__ float max_s;
+    __shared__ float denom;
+    const float scale = rsqrtf((float)head_dim);
+    float local_max = -INFINITY;
+
+    for (uint32_t s = tid; s < seq_len; s += blockDim.x) {
+        const float *kv = k_cache + (((uint64_t)s * n_kv_head) + kvh) * head_dim;
+        float dot = 0.0f;
+        for (uint32_t d = 0; d < head_dim; ++d) dot += qh[d] * kv[d];
+        scores[s] = dot * scale;
+        local_max = fmaxf(local_max, scores[s]);
+    }
+    partial[tid] = local_max;
+    __syncthreads();
+    for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (tid < stride) partial[tid] = fmaxf(partial[tid], partial[tid + stride]);
+        __syncthreads();
+    }
+    if (tid == 0u) max_s = partial[0];
+    __syncthreads();
+
+    float local_sum = 0.0f;
+    for (uint32_t s = tid; s < seq_len; s += blockDim.x) {
+        const float w = expf(scores[s] - max_s);
+        scores[s] = w;
+        local_sum += w;
+    }
+    partial[tid] = local_sum;
+    __syncthreads();
+    for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (tid < stride) partial[tid] += partial[tid + stride];
+        __syncthreads();
+    }
+    if (tid == 0u) denom = partial[0];
+    __syncthreads();
+
+    float *out = heads + (uint64_t)h * head_dim;
+    for (uint32_t d = tid; d < head_dim; d += blockDim.x) {
+        float acc = 0.0f;
+        for (uint32_t s = 0; s < seq_len; ++s) {
+            const float *vv = v_cache + (((uint64_t)s * n_kv_head) + kvh) * head_dim;
+            acc += scores[s] * vv[d];
+        }
+        out[d] = acc / denom;
+    }
+}
+
 __global__ static void attention_prefill_raw_kernel(
         float *heads,
         const float *sinks,

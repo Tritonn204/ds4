@@ -324,6 +324,35 @@ extern "C" int ds4_gpu_attention_decode_raw_batch_heads_tensor(
                                       n_head, head_dim);
 }
 
+extern "C" int ds4_gpu_attention_decode_qwen_gqa_tensor(
+        ds4_gpu_tensor       *heads,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *k_cache,
+        const ds4_gpu_tensor *v_cache,
+        uint32_t                seq_len,
+        uint32_t                n_q_head,
+        uint32_t                n_kv_head,
+        uint32_t                head_dim) {
+    if (!heads || !q || !k_cache || !v_cache || seq_len == 0u || seq_len > 8192u ||
+        n_q_head == 0u || n_kv_head == 0u || (n_q_head % n_kv_head) != 0u ||
+        heads->bytes < (uint64_t)n_q_head * head_dim * sizeof(float) ||
+        q->bytes < (uint64_t)n_q_head * head_dim * sizeof(float) ||
+        k_cache->bytes < (uint64_t)seq_len * n_kv_head * head_dim * sizeof(float) ||
+        v_cache->bytes < (uint64_t)seq_len * n_kv_head * head_dim * sizeof(float)) {
+        return 0;
+    }
+    attention_decode_qwen_gqa_kernel<<<(unsigned)n_q_head, 256>>>(
+            (float *)heads->ptr,
+            (const float *)q->ptr,
+            (const float *)k_cache->ptr,
+            (const float *)v_cache->ptr,
+            seq_len,
+            n_q_head,
+            n_kv_head,
+            head_dim);
+    return cuda_ok(cudaGetLastError(), "attention decode qwen gqa launch");
+}
+
 extern "C" int ds4_gpu_attention_decode_mixed_batch_heads_tensor(
         ds4_gpu_tensor       *heads,
         const void             *model_map,

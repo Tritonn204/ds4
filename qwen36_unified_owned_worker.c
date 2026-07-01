@@ -75,6 +75,40 @@ typedef struct full_layer_state {
     float *k_all;
     float *v_all;
     float *output_seq;
+    float *step_attn_in;
+    float *step_qg;
+    float *step_kk;
+    float *step_vv;
+    ds4_gpu_tensor *step_input_gpu;
+    ds4_gpu_tensor *step_attn_in_gpu;
+    ds4_gpu_tensor *step_qg_gpu;
+    ds4_gpu_tensor *step_k_gpu;
+    ds4_gpu_tensor *step_v_gpu;
+    ds4_gpu_tensor *step_attn_out_gpu;
+    ds4_gpu_tensor *step_proj_out_gpu;
+    ds4_gpu_tensor *step_q_cur_gpu;
+    ds4_gpu_tensor *step_gate_gpu;
+    ds4_gpu_tensor *step_heads_gpu;
+    ds4_gpu_tensor *attn_k_cache_gpu;
+    ds4_gpu_tensor *attn_v_cache_gpu;
+    float *ffn_router_logits_cpu;
+    float *ffn_shared_out_cpu;
+    float *ffn_expert_down_cpu;
+    float *ffn_routed_out_cpu;
+    float *ffn_post_cpu;
+    uint32_t *ffn_router_selected_cpu;
+    float *ffn_router_weights_cpu;
+    ds4_gpu_tensor *ffn_residual_gpu;
+    ds4_gpu_tensor *ffn_post_gpu;
+    ds4_gpu_tensor *ffn_router_logits_gpu;
+    ds4_gpu_tensor *ffn_shared_gate_gpu;
+    ds4_gpu_tensor *ffn_shared_up_gpu;
+    ds4_gpu_tensor *ffn_shared_mid_gpu;
+    ds4_gpu_tensor *ffn_shared_out_gpu;
+    ds4_gpu_tensor *ffn_expert_gate_gpu;
+    ds4_gpu_tensor *ffn_expert_up_gpu;
+    ds4_gpu_tensor *ffn_expert_mid_gpu;
+    ds4_gpu_tensor *ffn_expert_down_gpu;
 } full_layer_state;
 
 typedef struct full_layer_dbg_scratch {
@@ -167,6 +201,7 @@ static int read_f32_tensor(const qwen36_gguf_file *gf, const qwen36_gguf_tensor 
 static double now_ms(void);
 static void free_full_layer_state(full_layer_state *st);
 static int ensure_full_layer_state_cap(full_layer_state *st, uint32_t need, char *err, size_t err_cap);
+static int ensure_full_layer_decode_scratch(full_layer_state *st, char *err, size_t err_cap);
 static int ensure_owned_decode_cap(unified_session_state *st, uint32_t need, char *err, size_t err_cap);
 static inline float sigmoidf_local(float x);
 static inline float softplusf_local(float x);
@@ -433,11 +468,48 @@ static void free_full_layer_state(full_layer_state *st) {
     free(st->k_all);
     free(st->v_all);
     free(st->output_seq);
+    free(st->step_attn_in);
+    free(st->step_qg);
+    free(st->step_kk);
+    free(st->step_vv);
+    free(st->ffn_router_logits_cpu);
+    free(st->ffn_shared_out_cpu);
+    free(st->ffn_expert_down_cpu);
+    free(st->ffn_routed_out_cpu);
+    free(st->ffn_post_cpu);
+    free(st->ffn_router_selected_cpu);
+    free(st->ffn_router_weights_cpu);
+    ds4_gpu_tensor_free(st->step_input_gpu);
+    ds4_gpu_tensor_free(st->step_attn_in_gpu);
+    ds4_gpu_tensor_free(st->step_qg_gpu);
+    ds4_gpu_tensor_free(st->step_k_gpu);
+    ds4_gpu_tensor_free(st->step_v_gpu);
+    ds4_gpu_tensor_free(st->step_attn_out_gpu);
+    ds4_gpu_tensor_free(st->step_proj_out_gpu);
+    ds4_gpu_tensor_free(st->step_q_cur_gpu);
+    ds4_gpu_tensor_free(st->step_gate_gpu);
+    ds4_gpu_tensor_free(st->step_heads_gpu);
+    ds4_gpu_tensor_free(st->attn_k_cache_gpu);
+    ds4_gpu_tensor_free(st->attn_v_cache_gpu);
+    ds4_gpu_tensor_free(st->ffn_residual_gpu);
+    ds4_gpu_tensor_free(st->ffn_post_gpu);
+    ds4_gpu_tensor_free(st->ffn_router_logits_gpu);
+    ds4_gpu_tensor_free(st->ffn_shared_gate_gpu);
+    ds4_gpu_tensor_free(st->ffn_shared_up_gpu);
+    ds4_gpu_tensor_free(st->ffn_shared_mid_gpu);
+    ds4_gpu_tensor_free(st->ffn_shared_out_gpu);
+    ds4_gpu_tensor_free(st->ffn_expert_gate_gpu);
+    ds4_gpu_tensor_free(st->ffn_expert_up_gpu);
+    ds4_gpu_tensor_free(st->ffn_expert_mid_gpu);
+    ds4_gpu_tensor_free(st->ffn_expert_down_gpu);
     memset(st, 0, sizeof(*st));
 }
 
 static int ensure_full_layer_state_cap(full_layer_state *st, uint32_t need, char *err, size_t err_cap) {
     float *new_k = NULL, *new_v = NULL, *new_out = NULL;
+    ds4_gpu_tensor *new_k_gpu = NULL, *new_v_gpu = NULL;
+    const uint64_t old_bytes =
+        (uint64_t)st->seq_len * FULL_NUM_KV_HEADS * FULL_HEAD_DIM * sizeof(float);
     uint32_t new_cap = st->seq_cap ? st->seq_cap : 1u;
     if (need <= st->seq_cap) return 1;
     while (new_cap < need) {
@@ -450,14 +522,92 @@ static int ensure_full_layer_state_cap(full_layer_state *st, uint32_t need, char
     new_k = (float *)realloc(st->k_all, (size_t)new_cap * FULL_NUM_KV_HEADS * FULL_HEAD_DIM * sizeof(float));
     new_v = (float *)realloc(st->v_all, (size_t)new_cap * FULL_NUM_KV_HEADS * FULL_HEAD_DIM * sizeof(float));
     new_out = (float *)realloc(st->output_seq, (size_t)new_cap * FULL_HIDDEN * sizeof(float));
-    if (!new_k || !new_v || !new_out) {
+    new_k_gpu = ds4_gpu_tensor_alloc((uint64_t)new_cap * FULL_NUM_KV_HEADS * FULL_HEAD_DIM * sizeof(float));
+    new_v_gpu = ds4_gpu_tensor_alloc((uint64_t)new_cap * FULL_NUM_KV_HEADS * FULL_HEAD_DIM * sizeof(float));
+    if (!new_k || !new_v || !new_out || !new_k_gpu || !new_v_gpu) {
+        ds4_gpu_tensor_free(new_k_gpu);
+        ds4_gpu_tensor_free(new_v_gpu);
         if (err && err_cap) snprintf(err, err_cap, "oom full layer state grow");
         return 0;
     }
     st->k_all = new_k;
     st->v_all = new_v;
     st->output_seq = new_out;
+    if (old_bytes) {
+        if (ds4_gpu_tensor_write(new_k_gpu, 0, st->k_all, old_bytes) == 0 ||
+            ds4_gpu_tensor_write(new_v_gpu, 0, st->v_all, old_bytes) == 0) {
+            ds4_gpu_tensor_free(new_k_gpu);
+            ds4_gpu_tensor_free(new_v_gpu);
+            if (err && err_cap) snprintf(err, err_cap, "gpu kv cache grow upload failed");
+            return 0;
+        }
+    }
+    ds4_gpu_tensor_free(st->attn_k_cache_gpu);
+    ds4_gpu_tensor_free(st->attn_v_cache_gpu);
+    st->attn_k_cache_gpu = new_k_gpu;
+    st->attn_v_cache_gpu = new_v_gpu;
     st->seq_cap = new_cap;
+    return 1;
+}
+
+static int ensure_full_layer_decode_scratch(full_layer_state *st, char *err, size_t err_cap) {
+    const uint64_t hidden_bytes = (uint64_t)FULL_HIDDEN * sizeof(float);
+    const uint64_t qg_bytes = (uint64_t)FULL_ATTN_GATE_DIM * 2u * sizeof(float);
+    const uint64_t kv_bytes = (uint64_t)FULL_NUM_KV_HEADS * FULL_HEAD_DIM * sizeof(float);
+    const uint64_t attn_out_bytes = (uint64_t)FULL_ATTN_GATE_DIM * sizeof(float);
+    const uint64_t router_logits_bytes = (uint64_t)ROUTER_COUNT * sizeof(float);
+    const uint64_t shared_bytes = (uint64_t)FULL_INTER * sizeof(float);
+    const uint64_t topk = 8u;
+    if (!st) return 0;
+
+    if (!st->step_attn_in) st->step_attn_in = (float *)malloc((size_t)hidden_bytes);
+    if (!st->step_qg) st->step_qg = (float *)malloc((size_t)qg_bytes);
+    if (!st->step_kk) st->step_kk = (float *)malloc((size_t)kv_bytes);
+    if (!st->step_vv) st->step_vv = (float *)malloc((size_t)kv_bytes);
+    if (!st->ffn_router_logits_cpu) st->ffn_router_logits_cpu = (float *)malloc((size_t)router_logits_bytes);
+    if (!st->ffn_shared_out_cpu) st->ffn_shared_out_cpu = (float *)malloc((size_t)hidden_bytes);
+    if (!st->ffn_expert_down_cpu) st->ffn_expert_down_cpu = (float *)malloc((size_t)hidden_bytes);
+    if (!st->ffn_routed_out_cpu) st->ffn_routed_out_cpu = (float *)malloc((size_t)hidden_bytes);
+    if (!st->ffn_post_cpu) st->ffn_post_cpu = (float *)malloc((size_t)hidden_bytes);
+    if (!st->ffn_router_selected_cpu) st->ffn_router_selected_cpu = (uint32_t *)malloc((size_t)topk * sizeof(uint32_t));
+    if (!st->ffn_router_weights_cpu) st->ffn_router_weights_cpu = (float *)malloc((size_t)topk * sizeof(float));
+
+    if (!st->step_input_gpu) st->step_input_gpu = ds4_gpu_tensor_alloc(hidden_bytes);
+    if (!st->step_attn_in_gpu) st->step_attn_in_gpu = ds4_gpu_tensor_alloc(hidden_bytes);
+    if (!st->step_qg_gpu) st->step_qg_gpu = ds4_gpu_tensor_alloc(qg_bytes);
+    if (!st->step_k_gpu) st->step_k_gpu = ds4_gpu_tensor_alloc(kv_bytes);
+    if (!st->step_v_gpu) st->step_v_gpu = ds4_gpu_tensor_alloc(kv_bytes);
+    if (!st->step_attn_out_gpu) st->step_attn_out_gpu = ds4_gpu_tensor_alloc(attn_out_bytes);
+    if (!st->step_proj_out_gpu) st->step_proj_out_gpu = ds4_gpu_tensor_alloc(hidden_bytes);
+    if (!st->step_q_cur_gpu) st->step_q_cur_gpu = ds4_gpu_tensor_alloc(attn_out_bytes);
+    if (!st->step_gate_gpu) st->step_gate_gpu = ds4_gpu_tensor_alloc(attn_out_bytes);
+    if (!st->step_heads_gpu) st->step_heads_gpu = ds4_gpu_tensor_alloc(attn_out_bytes);
+
+    if (!st->ffn_residual_gpu) st->ffn_residual_gpu = ds4_gpu_tensor_alloc(hidden_bytes);
+    if (!st->ffn_post_gpu) st->ffn_post_gpu = ds4_gpu_tensor_alloc(hidden_bytes);
+    if (!st->ffn_router_logits_gpu) st->ffn_router_logits_gpu = ds4_gpu_tensor_alloc(router_logits_bytes);
+    if (!st->ffn_shared_gate_gpu) st->ffn_shared_gate_gpu = ds4_gpu_tensor_alloc(shared_bytes);
+    if (!st->ffn_shared_up_gpu) st->ffn_shared_up_gpu = ds4_gpu_tensor_alloc(shared_bytes);
+    if (!st->ffn_shared_mid_gpu) st->ffn_shared_mid_gpu = ds4_gpu_tensor_alloc(shared_bytes);
+    if (!st->ffn_shared_out_gpu) st->ffn_shared_out_gpu = ds4_gpu_tensor_alloc(hidden_bytes);
+    if (!st->ffn_expert_gate_gpu) st->ffn_expert_gate_gpu = ds4_gpu_tensor_alloc(shared_bytes);
+    if (!st->ffn_expert_up_gpu) st->ffn_expert_up_gpu = ds4_gpu_tensor_alloc(shared_bytes);
+    if (!st->ffn_expert_mid_gpu) st->ffn_expert_mid_gpu = ds4_gpu_tensor_alloc(shared_bytes);
+    if (!st->ffn_expert_down_gpu) st->ffn_expert_down_gpu = ds4_gpu_tensor_alloc(topk * hidden_bytes);
+
+    if (!st->step_attn_in || !st->step_qg || !st->step_kk || !st->step_vv ||
+        !st->ffn_router_logits_cpu || !st->ffn_shared_out_cpu || !st->ffn_expert_down_cpu ||
+        !st->ffn_routed_out_cpu || !st->ffn_post_cpu || !st->ffn_router_selected_cpu ||
+        !st->ffn_router_weights_cpu || !st->step_input_gpu || !st->step_attn_in_gpu ||
+        !st->step_qg_gpu || !st->step_k_gpu || !st->step_v_gpu || !st->step_attn_out_gpu ||
+        !st->step_proj_out_gpu || !st->step_q_cur_gpu || !st->step_gate_gpu || !st->step_heads_gpu ||
+        !st->ffn_residual_gpu || !st->ffn_post_gpu ||
+        !st->ffn_router_logits_gpu || !st->ffn_shared_gate_gpu || !st->ffn_shared_up_gpu ||
+        !st->ffn_shared_mid_gpu || !st->ffn_shared_out_gpu || !st->ffn_expert_gate_gpu ||
+        !st->ffn_expert_up_gpu || !st->ffn_expert_mid_gpu || !st->ffn_expert_down_gpu) {
+        if (err && err_cap) snprintf(err, err_cap, "oom full layer decode scratch");
+        return 0;
+    }
     return 1;
 }
 

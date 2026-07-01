@@ -274,6 +274,11 @@ int ds4_gpu_shared_gate_up_swiglu_q8_0_tensor(
         uint64_t                out_dim,
         const ds4_gpu_tensor *x,
         float                   clamp);
+int ds4_gpu_sigmoid_mul_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *x,
+        const ds4_gpu_tensor *gate,
+        uint32_t              n);
 
 int ds4_gpu_matmul_f16_tensor(
         ds4_gpu_tensor       *out,
@@ -630,6 +635,16 @@ int ds4_gpu_attention_decode_raw_batch_heads_tensor(
         uint32_t                raw_start,
         uint32_t                window,
         uint32_t                n_head,
+        uint32_t                head_dim);
+
+int ds4_gpu_attention_decode_qwen_gqa_tensor(
+        ds4_gpu_tensor       *heads,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *k_cache,
+        const ds4_gpu_tensor *v_cache,
+        uint32_t                seq_len,
+        uint32_t                n_q_head,
+        uint32_t                n_kv_head,
         uint32_t                head_dim);
 
 int ds4_gpu_attention_decode_mixed_batch_heads_tensor(
