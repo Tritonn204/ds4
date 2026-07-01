@@ -8,6 +8,181 @@
 - Current runtime/oracle Q8 GGUF:
   - `/home/tritonn/.cache/huggingface/hub/models--unsloth--Qwen3.6-35B-A3B-GGUF/snapshots/a483e9e6cbd595906af30beda3187c2663a1118c/Qwen3.6-35B-A3B-Q8_0.gguf`
 
+## June 30, 2026 Prefill Checkpoint
+
+The prefill investigation is now split into two distinct fault surfaces and they should not be mixed:
+
+- standalone full-attention GPU worker math
+- integrated owned-session prefill drift across owned depth
+
+What changed:
+
+- `qwen36_gpu_full_layer_worker.c` was still using the legacy `1 + w` RMSNorm contract for:
+  - `attn_norm`
+  - `post_attn_norm`
+- the integrated paths and the current CPU reference already used the raw-weight contract instead
+- after restoring the standalone worker to raw-weight RMSNorm, the dedicated full-layer prefill isolation harness improved materially
+
+Current standalone full-layer prefill isolation result:
+
+- harness:
+  - `misc/qwen36_full_layer_prefill_isolation.py`
+- worker:
+  - `qwen36-gpu-full-layer-worker`
+- prompt:
+  - `misc/qwen36_oracle_prompts/code_review.txt`
+- observed `seq_rmse` after the fix:
+  - `blk.3 ~= 0.0061`
+  - `blk.7 ~= 0.0089`
+  - `blk.11 ~= 0.0102`
+  - `blk.15 ~= 0.0090`
+
+Interpretation:
+
+- the standalone full-layer worker is no longer catastrophically wrong in prefill isolation
+- the old isolation result was overstating the problem because the worker itself had a normalization bug
+- remaining standalone error is still non-zero, but it is now in the same regime as a narrow numeric audit rather than an obviously broken contract
+
+Current integrated owned-session prefill result:
+
+- harness:
+  - `misc/qwen36_power2_owned_session_validator.py`
+- owned-session configuration:
+  - repo-truth ownership pattern
+  - for every 4 layers: 3 hybrid, 1 full
+- measured splice drift on the same prompt:
+  - `depth=4 splice_seq_rmse ~= 0.00321`
+  - `depth=8 splice_seq_rmse ~= 0.00641`
+  - `depth=16 splice_seq_rmse ~= 0.01297`
+  - `depth=32 splice_seq_rmse ~= 0.02237`
+
+Cycle-by-cycle localization from the updated owned-session validator:
+
+- `depth=8`
+  - `POST_L2 ~= 0.00064`
+  - `POST_FULL3 ~= 0.00321`
+  - `POST_L6 ~= 0.00399`
+  - `POST_FULL7 ~= 0.00641`
+- `depth=16`
+  - `POST_L2 ~= 0.00064`
+  - `POST_FULL3 ~= 0.00321`
+  - `POST_L6 ~= 0.00399`
+  - `POST_FULL7 ~= 0.00641`
+  - `POST_L10 ~= 0.00792`
+  - `POST_FULL11 ~= 0.01092`
+  - `POST_L14 ~= 0.01127`
+  - `POST_FULL15 ~= 0.01297`
+- `depth=32`
+  - `POST_L2 ~= 0.00064`
+  - `POST_FULL3 ~= 0.00321`
+  - `POST_L6 ~= 0.00399`
+  - `POST_FULL7 ~= 0.00641`
+  - `POST_L10 ~= 0.00792`
+  - `POST_FULL11 ~= 0.01092`
+  - `POST_L14 ~= 0.01127`
+  - `POST_FULL15 ~= 0.01297`
+  - `POST_L18 ~= 0.01359`
+  - `POST_FULL19 ~= 0.01552`
+  - `POST_L22 ~= 0.01592`
+  - `POST_FULL23 ~= 0.01791`
+  - `POST_L26 ~= 0.01856`
+  - `POST_FULL27 ~= 0.01944`
+  - `POST_L30 ~= 0.02027`
+  - `POST_FULL31 ~= 0.02237`
+
+Interpretation:
+
+- integrated owned-session prefill still drifts monotonically with owned depth
+- the first owned full-attention boundary at `blk.3` is already wrong
+- hybrid-only pre-full drift does accumulate across cycles
+- but each full-attention boundary also adds an extra increment on top of that pre-full drift
+- the first full boundary is still the first major jump:
+  - `POST_L2 ~= 0.00064`
+  - `POST_FULL3 ~= 0.00321`
+- later full-boundary jumps are smaller than that first jump, but remain real
+- that drift compounds even after the standalone full-layer worker normalization fix
+- therefore the remaining primary bug is in the integrated prefill boundary/state path, not in the HF tail splice and not in ownership topology selection
+
+Immediate audit target after this localization:
+
+- focus on the first owned cycle first:
+  - hybrid `blk.0..2` prefill output into full `blk.3`
+  - full `blk.3` prefill state/output handoff back into the next hybrid cycle
+- then, if needed, audit the smaller recurring per-full-layer increment that remains at later ownership points
+
+Immediate action harness:
+
+- dedicated first-full-boundary prefill substage audit:
+  - `misc/qwen36_blk3_prefill_full_debug.py`
+  - enables GPU-vs-CPU stage diffs for the first owned full layer during prefill
+  - emits per-row `DBG_FULL[3]` diffs for:
+    - `ATTN_IN`
+    - `QG`
+    - `KK`
+    - `VV`
+    - `Q_CUR`
+    - `K_CUR`
+    - `V_CUR`
+    - `ATTN_OUT`
+    - `PROJ_OUT`
+    - `RESIDUAL`
+    - `POST_LN`
+    - `ROUTER`
+    - `SHARED_OUT`
+    - `ROUTED_OUT`
+    - `FINAL_OUT`
+  - prints a row-wise “worst stage” summary so the next patch target is chosen from an immediate concrete failure rather than a splice aggregate
+
+Groundbreaking contract correction from the `blk.3` harness:
+
+- the dedicated `blk.3` prefill full-stage harness proved that the dominant first-full-boundary error was in `Q_CUR/K_CUR`, not in the MoE tail
+- this matters because `1 + w` had been helpful in other normalization sites, so it was plausible that full-layer `attn_q_norm/attn_k_norm` still wanted that contract
+- the harness showed the opposite for this path:
+  - full-layer `q_norm/k_norm` should use raw weights, not `1 + w`
+- patched files:
+  - `qwen36_unified_owned_worker.c`
+  - `qwen36_unified_full_gpu.inc`
+  - `qwen36_gpu_full_layer_worker.c`
+
+Measured effect from the focused `blk.3` prefill harness (`misc/qwen36_blk3_prefill_full_debug.py`):
+
+- before the patch:
+  - `row=0 Q_CUR ~= 0.0321`
+  - `row=0 K_CUR ~= 0.0315`
+  - `row=4 K_CUR ~= 0.0341`
+  - `row=7 K_CUR ~= 0.0248`
+- after the patch:
+  - `row=0 Q_CUR ~= 0.0183`
+  - `row=0 K_CUR ~= 0.0180`
+  - `row=4 K_CUR ~= 0.0194`
+  - `row=7 K_CUR ~= 0.0141`
+
+Interpretation:
+
+- this is not a tiny cosmetic change; it cuts the dominant early full-layer drift by roughly forty percent or better on the audited rows
+- therefore the old assumption “`1 + w` is probably still right here because it helped elsewhere” is no longer defensible for full-layer `attn_q_norm/attn_k_norm`
+- the remaining prefill drift is now a post-correction problem, not evidence that the correction was wrong
+- after this patch, some rows still have `K_CUR` as the worst stage, but the gap is much smaller and later `ROUTER`/FFN stages are now competitive on some rows
+
+Interpretation rule:
+
+- if the first bad row already spikes at an early attention stage, audit full-layer projection/rope/attention math
+- if attention stages are clean but `ROUTER` or later MoE stages spike first, audit the full-layer FFN/router contract
+- if `FINAL_OUT` jumps while earlier stages stay small, audit residual/handoff semantics rather than core math
+
+Operational rule for the next study phase:
+
+- run standalone full-layer prefill isolation first
+- if isolation is bad, audit full-layer worker math
+- if isolation is sane but owned-depth splice drift still grows, audit integrated owned-session prefill boundary/state semantics
+
+The one-shot entrypoint now reflects that ordering:
+
+- `misc/qwen36_blk0_prefill_one_shot.py`
+  - phase 1: standalone full-layer prefill isolation
+  - phase 2: power-of-2 owned-layer splice validation
+  - phase 3: optional GPU-vs-CPU row-state summary from prefill logs
+
 ## Transitional Runtime Contract
 
 The current working runtime path is transitional, not final-form DS4-native execution.
@@ -258,6 +433,48 @@ Interpretation:
 - we can now extend the unified path upward from a real, calibrated base rather than a protocol-only scaffold
 
 Extended unified hybrid result:
+
+## Current Handoff Status
+
+As of June 29, 2026, the `hybrid_gpu_cycles=0` path is again the stable baseline.
+
+What changed in the study:
+
+- the earlier full-layer debug harness was overstating `POST_LN` / `ROUTER` drift because the CPU reference path still used the legacy `1 + w` RMSNorm contract for:
+  - `attn_norm`
+  - `post_attn_norm`
+- after restoring the raw-weight RMSNorm contract in the full-layer CPU/reference paths, the full-layer GPU-vs-CPU probe for `blk.3` became numerically sane again
+  - typical `POST_LN`, `ROUTER`, `SHARED_OUT`, `ROUTED_OUT`, and `FINAL_OUT` probe RMSEs dropped from obviously-bad large values to small calibration-noise values
+
+What is now actually proven:
+
+- the probe itself is no longer the main source of noise
+- `hybrid_gpu_cycles=1` still diverges semantically from `hybrid_gpu_cycles=0`
+- that divergence is visible as a direct `cycles=0` vs `cycles=1` difference inside full layer `blk.3`
+
+Current strongest direct `cycles=0` vs `cycles=1` signals for the step window around the repetition onset:
+
+- `Q_CUR`
+- `K_CUR`
+- `ROUTER`
+- then downstream:
+  - `SHARED_OUT`
+  - `ROUTED_OUT`
+  - `FINAL_OUT`
+
+Interpretation:
+
+- this is no longer best described as a pure FFN/router-only bug
+- the router amplifies the failure, but upstream full-layer attention state already differs between `cycles=0` and `cycles=1`
+- the most likely remaining fault surface is now:
+  - full-layer entry / cache-state / position-sensitive handoff into `blk.3`
+  - followed by router/top-k amplification
+
+Important practical read:
+
+- per-run GPU-vs-CPU agreement can now look good for both runs individually
+- but `cycles=0` and `cycles=1` still choose materially different router top-k sets at the same decode steps
+- therefore the remaining bug is a real runtime semantic drift, not just a broken comparison harness
 
 - the unified worker was also compared against `qwen36-live-contract-worker`
   across the full flattened 30-fixture owned hybrid chain
@@ -535,6 +752,76 @@ Interpretation:
 - therefore the next optimization target should not be only "push this same projection trick to even more cycles"; it should be:
   - move more of hybrid step internals onto GPU, especially MoE/shared closure, or
   - pivot effort from hybrid polishing toward the fuller narrow GPU runtime end state
+
+Late-window repetition diagnosis:
+
+- user-visible degradation under `--owned-session-unified-hybrid-gpu-cycles > 0` was later pinned down more precisely:
+  - weak semantic looping already appears with `hybrid_gpu_cycles = 1`
+  - stronger/stamping repetition appears with larger owned GPU-hybrid coverage
+  - onset is not immediate; it emerges later in decode rather than at the first generated tokens
+- targeted late-window probes were then added around the onset region using:
+  - `QWEN36_DBG_HYBRID_STEP_START`
+  - `QWEN36_DBG_HYBRID_STEP_END`
+- per-layer late-window compares for the GPU-owned hybrid layers showed:
+  - `blk.0` hybrid GPU step remained tight versus CPU reference
+  - `blk.1` hybrid GPU step remained tight versus CPU reference
+  - `blk.2` hybrid GPU step remained tight versus CPU reference
+  - typical `FINAL_OUT` error in those probes stayed in the low `1e-4 .. 1e-3` regime
+
+Interpretation:
+
+- the repetition regression is **not** explained by the math inside the first GPU-owned hybrid layers themselves
+- the likely fault surface moved from "hybrid internals" to "cycle boundary or full-layer decode step semantics"
+
+Cycle-boundary probe result:
+
+- a direct CPU-reference boundary probe was added around cycle `0`:
+  - `POST_L2`
+  - `POST_FULL3`
+  - `PRE_L4`
+  - `POST_L4`
+- the decisive result was:
+  - `POST_L2` stays tight
+    - typically `~= 2e-4 .. 1e-3` RMSE
+  - the first major jump appears immediately at `POST_FULL3`
+    - commonly `~= 0.01 .. 0.05` RMSE
+    - with larger outliers in some late steps
+  - `PRE_L4` is identical to `POST_FULL3`
+    - therefore no extra corruption is introduced by the handoff buffer itself
+  - `POST_L4` is only slightly different from `PRE_L4`
+    - layer `4` propagates the error but does not originate it
+
+Current conclusion:
+
+- the first harmful decode-step divergence under the unified ROCm path is the **GPU full-layer step** at `blk.3`
+- this is not a `full -> next hybrid` handoff corruption bug
+- heavy full-layer debug then localized the first bad math inside `blk.3` more precisely:
+  - `ATTN_IN` remains essentially exact against CPU reference
+  - the first meaningful drift appears immediately in the raw projection outputs:
+    - `QG`
+    - `KK`
+    - `VV`
+  - downstream tensors such as `ATTN_OUT`, `PROJ_OUT`, and `FINAL_OUT` were still much tighter in early decode steps
+- that moved the immediate mitigation target from "full-layer attention/state semantics in general" to the narrower surface:
+  - full-attention `attn_q / attn_k / attn_v` projection generation inside the GPU full-layer path
+- the first incremental mitigation now in tree is:
+  - keep the unified full-layer GPU path for RMS norm, output projection, and FFN
+  - but source full-layer `Q/K/V` projections from decoded CPU weights cached in `full_layer_small_cache`
+  - this is intended to eliminate the first proven divergence site while preserving the rest of the narrowed GPU execution shape
+- the next debug/fix focus should be:
+  - whether this projection-only mitigation restores sane decode behavior for `hybrid_gpu_cycles >= 1`
+  - if not, the next remaining full-layer surfaces are:
+    - output projection
+    - FFN / router path
+    - full-layer state update semantics after those corrected projections
+- to reduce shell/invocation mistakes during these probes, the canonical entrypoint is now:
+  - `misc/qwen36_full_layer_probe.py`
+  - it assembles the known-good patched-session oracle command, the ten full-layer placements, and the shared fixture set automatically
+  - intended modes:
+    - `--probe baseline`
+    - `--probe boundary`
+    - `--probe breadcrumb`
+    - `--probe full-debug`
 
 ## Confirmed Contract Facts
 
@@ -3196,7 +3483,7 @@ Interpretation:
 To address that, we added:
 
 - `qwen36-gpu-full-layer-worker`
-  - persistent worker around the proven `qwen36-gpu-full-layer-q8-dynamic` math
+  - persistent worker around the standalone GPU full-layer path
   - protocol:
     - `PREFILL_SEQ <seq.f32>`
     - `STEP_ROW <row.f32>`
@@ -3213,6 +3500,15 @@ To address that, we added:
     - still dump the full hidden sequence between cycles so the already-proven hybrid workers do not need a protocol change
 
 This is the correct next optimization because it removes the last obvious per-token owned replay without reopening the already-validated hybrid cache path.
+
+Important update from the later prefill audit:
+
+- the standalone full-layer worker was not actually clean at this point in the timeline
+- it still carried the legacy `1 + w` RMSNorm contract on:
+  - `attn_norm`
+  - `post_attn_norm`
+- after restoring raw-weight RMSNorm there, standalone full-layer prefill isolation became much healthier
+- so any older study text that treats the worker as already-proven full-layer math should be read as historical, not current truth
 
 ## 36-Owned vs 40-Owned Residency Cliff
 
