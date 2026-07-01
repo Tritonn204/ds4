@@ -1845,7 +1845,7 @@ static int ensure_layer_gpu_step_scratch(const live_fixture *fx, layer_step_scra
     sc->expert_gate_gpu = ds4_gpu_tensor_alloc(inter_bytes);
     sc->expert_up_gpu = ds4_gpu_tensor_alloc(inter_bytes);
     sc->expert_mid_gpu = ds4_gpu_tensor_alloc(inter_bytes);
-    sc->expert_down_gpu = ds4_gpu_tensor_alloc(hidden_bytes);
+    sc->expert_down_gpu = ds4_gpu_tensor_alloc((uint64_t)fx->topk * hidden_bytes);
     sc->q_gpu = ds4_gpu_tensor_alloc((uint64_t)fx->key_dim * sizeof(float));
     sc->k_gpu = ds4_gpu_tensor_alloc((uint64_t)fx->key_dim * sizeof(float));
     sc->v_gpu = ds4_gpu_tensor_alloc((uint64_t)fx->value_dim * sizeof(float));
@@ -2366,12 +2366,19 @@ static int run_hybrid_layer_step_gpuproj(const live_fixture *fx,
             goto cleanup;
         }
         topk_softmax256(router_logits, fx->topk, router_idx, router_scores);
+        if (ds4_gpu_begin_commands() == 0) {
+            snprintf(err, err_cap, "gpu experts begin failed blk.%u", fx->layer);
+            goto cleanup;
+        }
         for (i = 0; i < fx->topk; ++i) {
             const uint64_t gate_expert_bytes = (uint64_t)(fx->inter * fx->hidden / 32u) * 34u;
             const uint64_t down_expert_bytes = (uint64_t)(fx->hidden * fx->inter / 32u) * 34u;
             const uint32_t expert_id = router_idx[i];
-            if (ds4_gpu_begin_commands() == 0) {
-                snprintf(err, err_cap, "gpu expert begin failed blk.%u", fx->layer);
+            ds4_gpu_tensor *expert_slot = ds4_gpu_tensor_view(sc->expert_down_gpu,
+                                                               (uint64_t)i * hidden_bytes,
+                                                               hidden_bytes);
+            if (!expert_slot) {
+                snprintf(err, err_cap, "gpu expert slot view failed blk.%u", fx->layer);
                 goto cleanup;
             }
             if (ds4_gpu_matmul_q8_0_pair_tensor(sc->expert_gate_gpu, sc->expert_up_gpu,
@@ -2379,25 +2386,31 @@ static int run_hybrid_layer_step_gpuproj(const live_fixture *fx,
                                                 layer->ffn_gate_exps->abs_offset + gate_expert_bytes * expert_id,
                                                 layer->ffn_up_exps->abs_offset + gate_expert_bytes * expert_id,
                                                 fx->hidden, fx->inter, fx->inter, sc->post_gpu, 1u) == 0) {
+                ds4_gpu_tensor_free(expert_slot);
                 snprintf(err, err_cap, "gpu expert gate/up failed blk.%u", fx->layer);
                 goto cleanup;
             }
             if (ds4_gpu_swiglu_tensor(sc->expert_mid_gpu, sc->expert_gate_gpu, sc->expert_up_gpu,
                                       fx->inter, 80.0f, 1.0f) == 0) {
+                ds4_gpu_tensor_free(expert_slot);
                 snprintf(err, err_cap, "gpu expert swiglu failed blk.%u", fx->layer);
                 goto cleanup;
             }
-            if (ds4_gpu_matmul_q8_0_tensor(sc->expert_down_gpu, mf->map, mf->size,
+            if (ds4_gpu_matmul_q8_0_tensor(expert_slot, mf->map, mf->size,
                                            layer->ffn_down_exps->abs_offset + down_expert_bytes * expert_id,
                                            fx->inter, fx->hidden, sc->expert_mid_gpu, 1u) == 0) {
+                ds4_gpu_tensor_free(expert_slot);
                 snprintf(err, err_cap, "gpu expert down failed blk.%u", fx->layer);
                 goto cleanup;
             }
-            if (ds4_gpu_end_commands() == 0) {
-                snprintf(err, err_cap, "gpu expert end failed blk.%u", fx->layer);
-                goto cleanup;
-            }
-            if (ds4_gpu_tensor_read(sc->expert_down_gpu, 0, down, hidden_bytes) == 0) {
+            ds4_gpu_tensor_free(expert_slot);
+        }
+        if (ds4_gpu_end_commands() == 0) {
+            snprintf(err, err_cap, "gpu experts end failed blk.%u", fx->layer);
+            goto cleanup;
+        }
+        for (i = 0; i < fx->topk; ++i) {
+            if (ds4_gpu_tensor_read(sc->expert_down_gpu, (uint64_t)i * hidden_bytes, down, hidden_bytes) == 0) {
                 snprintf(err, err_cap, "gpu expert readback failed blk.%u", fx->layer);
                 goto cleanup;
             }
