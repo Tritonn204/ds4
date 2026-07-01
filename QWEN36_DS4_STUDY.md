@@ -103,6 +103,49 @@ Interpretation:
 - that drift compounds even after the standalone full-layer worker normalization fix
 - therefore the remaining primary bug is in the integrated prefill boundary/state path, not in the HF tail splice and not in ownership topology selection
 
+Important later update from the owned-depth validator:
+
+- harness:
+  - `misc/qwen36_power2_owned_session_validator.py`
+- this validator now uses repo-truth ownership:
+  - for every 4 layers: 3 hybrid, 1 full
+- with the standalone full-layer raw-weight RMSNorm correction in place, behavior at the splice boundary is materially healthier than the older study state implied:
+  - `depth=8`
+    - `argmax_equal=True`
+    - `topk_overlap=7/8`
+    - `splice_seq_rmse ~= 0.00641`
+  - `depth=16`
+    - `argmax_equal=True`
+    - `topk_overlap=5/8`
+    - `splice_seq_rmse ~= 0.01297`
+  - `depth=32`
+    - `argmax_equal=True`
+    - `topk_overlap=5/8`
+    - `splice_seq_rmse ~= 0.02237`
+- this does not mean the integrated drift problem is solved
+- it does mean the behavior surface is now much better aligned with CPU/HF than the earlier catastrophic-looking prefill reports suggested
+- practical interpretation:
+  - the remaining discrepancy now looks like bounded contract drift in the DS4-style mixed GPU/CPU runtime, not proof that the owned-session design is fundamentally wrong
+- the validator also makes depth-8 the current best owned splice point among the audited power-of-2 depths
+- this is a strong sign that the full-layer raw-weight normalization fix corrected a real load-bearing semantic bug rather than merely moving error around
+
+Runtime scheduling optimization now adopted on both paths:
+
+- the routed-expert FFN path originally did one GPU command buffer and one device sync per expert
+- that was already collapsed on hybrid layers into:
+  - one `begin_commands()`
+  - all expert gate/up, activation, and down projections enqueued back-to-back
+  - one `end_commands()`
+  - batched readback and CPU weighting afterward
+- the same transformation is now applied to the standalone/integrated full-layer FFN path in `qwen36_unified_full_gpu.inc`
+- implementation detail:
+  - `expert_down` is now sized for the whole expert union
+  - each expert writes into a `ds4_gpu_tensor_view(...)` slot
+  - the weighted CPU accumulation still happens after readback, so semantics are preserved
+- this is a scheduling/throughput fix, not a semantic contract fix
+- it should reduce avoidable GPU synchronization overhead without changing the mathematical target
+- because the hybrid version of this idea already produced real gains, the full-layer version is now part of repo truth and should be kept when auditing remaining drift
+
 Immediate audit target after this localization:
 
 - focus on the first owned cycle first:
