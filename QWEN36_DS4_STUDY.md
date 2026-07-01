@@ -146,6 +146,124 @@ Runtime scheduling optimization now adopted on both paths:
 - it should reduce avoidable GPU synchronization overhead without changing the mathematical target
 - because the hybrid version of this idea already produced real gains, the full-layer version is now part of repo truth and should be kept when auditing remaining drift
 
+Full-layer decode scratch reuse has now also cleared the behavior gate:
+
+- full-layer persistent scratch had previously looked promising in narrow splice checks but had not yet been trusted for long decode behavior
+- a dedicated four-way study was added:
+  - `misc/qwen36_full_layer_opt_study.py`
+  - cases:
+    - `baseline`
+    - `batched_only`
+    - `scratch_only`
+    - `both`
+- on the real 10-cycle owned-session layout, the study showed:
+  - `baseline`: ~13104.5 ms prefill
+  - `batched_only`: ~13030.6 ms
+  - `scratch_only`: ~12593.5 ms
+  - `both`: ~11938.9 ms
+- in that study all four cases preserved the same splice signal:
+  - `argmax_equal=true`
+  - `topk_overlap=5`
+  - `splice_seq_rmse=0.02251144`
+- after that, the long decode behavior oracle was rerun with both toggles enabled and token output stayed clean
+- practical conclusion:
+  - full-layer FFN expert batching is kept
+  - full-layer persistent decode scratch is also now repo truth
+  - both are promoted to default-on behavior
+  - both still keep an escape hatch:
+    - `QWEN36_FULL_GPU_FFN_BATCHED_EXPERTS=0`
+    - `QWEN36_FULL_GPU_PERSISTENT_SCRATCH=0`
+
+Experimental full-layer GPU decode attention is now split into two distinct study states:
+
+- toggle:
+  - `QWEN36_FULL_GPU_DECODE_ATTN=1`
+- this path is still experimental and is **not** repo-truth default behavior
+
+First attempt: whole-prefix GPU re-upload per token
+
+- the initial Qwen-specific GPU full-attention decode path kept CPU `k_all/v_all` as the authoritative cache
+- on every decode step it:
+  - wrote `q_cur` to GPU
+  - re-uploaded the entire `K/V` prefix to GPU
+  - ran GPU decode attention
+  - read back attention output
+- this was directionally useful as a contract probe, but it was not DS4-shaped enough to be a performance win
+- practical result:
+  - output changed materially
+  - speed was not clearly better
+  - the design still spent bandwidth on replaying the whole prefix every token
+
+Second attempt: persistent incremental GPU KV row writes
+
+- the next patch changed the same experimental path to:
+  - preserve GPU KV cache across decode
+  - write only the new `K/V` row each token at the correct offset
+  - preserve GPU KV contents when cache growth reallocates the backing tensor
+- this is still not the final DS4-shaped solution, but it is materially closer:
+  - GPU cache becomes persistent across decode steps
+  - per-token bandwidth shifts from full-prefix replay to row append semantics
+
+Focused correctness result from `misc/qwen36_full_attn_decode_study.py`:
+
+- previous worst focused full-attention stage:
+  - `step=20`
+  - `stage=K_CUR`
+  - `rmse ~= 0.01450341`
+- incremental-GPU-KV experimental path:
+  - `step=26`
+  - `stage=Q_CUR`
+  - `rmse ~= 0.01350006`
+- incremental-GPU-KV plus GPU gating plus fused GPU `o_proj`:
+  - `step=20`
+  - `stage=K_CUR`
+  - `rmse ~= 0.01249349`
+
+Interpretation:
+
+- the incremental GPU KV variant tightened the worst focused full-attention stage error by roughly `~6.9%`
+- the next GPU-residency/sync-reduction round tightened it again by roughly `~7.5%` relative to the incremental-KV branch
+- cumulative focused improvement from the older baseline to the gated+projected branch is roughly `~13.9%`
+- therefore this experimental branch is mathematically healthier than the earlier whole-prefix-upload version
+- late-stage observed debug surfaces on the gated+projected branch remained controlled, for example at `step=32`:
+  - `ATTN_OUT rmse ~= 0.00080`
+  - `PROJ_OUT rmse ~= 0.00142`
+  - `FINAL_OUT rmse ~= 0.00185`
+  - top-k stayed effectively identical on the audited row
+- this does **not** yet prove an end-to-end decode win
+- it **does** justify continuing from the gated+projected branch rather than discarding GPU full-attention decode outright
+
+Current rule for this branch:
+
+- keep persistent incremental GPU KV as the experimental base when auditing full-attention decode performance
+- prefer the branch that also keeps post-attention gating and `o_proj` on GPU
+- do **not** regress to whole-prefix GPU re-upload as the main comparison target
+- the next full-attention experiment should aim at:
+  - sync reduction across the full-attention block
+  - keeping more of the attention path GPU-resident
+  - maximizing row-append bandwidth efficiency rather than replay bandwidth
+
+Router-select widening now also landed as an enabling patch:
+
+- DS4 already had GPU router-select helpers
+- but both ROCm and CUDA router-select paths were still hard-shaped to DeepSeek-style top-6 selection
+- they now accept up to top-8 selection width while preserving top-6 as the default when the caller passes zero/default width
+- patched files:
+  - `rocm/ds4_rocm_runtime.cuh`
+  - `rocm/ds4_rocm_router.cuh`
+  - `ds4_cuda.cu`
+- important limitation:
+  - this does **not** mean Qwen now uses DS4 routed-MoE kernels end to end
+  - the routed-MoE launch path is still more DeepSeek-shaped than the router-select API and still needs separate audit before claiming native top-8 routed execution
+- practical interpretation:
+  - router-select is no longer the immediate width blocker
+  - routed-MoE integration remains future work
+
+Build status for the above:
+
+- `make qwen36-unified-owned-worker-rocm qwen36-gpu-full-layer-worker`
+  - passes after these patches
+
 Immediate audit target after this localization:
 
 - focus on the first owned cycle first:
