@@ -245,7 +245,7 @@ static int run_gpu_ffn_from_residual(
 
     if (ds4_gpu_tensor_write(residual, 0, residual_in, seq_hidden_bytes) == 0) goto cleanup;
     if (ds4_gpu_begin_commands() == 0) goto cleanup;
-    if (ds4_gpu_rms_norm_weight_rows_tensor(post, residual, mf->map, mf->size,
+    if (ds4_gpu_rms_norm_weight_plus1_rows_tensor(post, residual, mf->map, mf->size,
                                             layer->post_attn_norm->abs_offset,
                                             hidden, n_tokens, QWEN_RMS_EPS) == 0) goto cleanup;
     if (ds4_gpu_matmul_f32_tensor(router_logits, mf->map, mf->size,
@@ -465,7 +465,7 @@ int main(int argc, char **argv) {
 
     if (ds4_gpu_tensor_write(input_gpu, 0, input_seq, (uint64_t)seq_len * HIDDEN * sizeof(float)) == 0) goto cleanup;
     if (ds4_gpu_begin_commands() == 0) goto cleanup;
-    if (ds4_gpu_rms_norm_weight_rows_tensor(attn_in_gpu, input_gpu, mf.map, mf.size,
+    if (ds4_gpu_rms_norm_weight_plus1_rows_tensor(attn_in_gpu, input_gpu, mf.map, mf.size,
                                             layer->attn_norm->abs_offset,
                                             HIDDEN, seq_len, QWEN_RMS_EPS) == 0) goto cleanup;
     if (ds4_gpu_matmul_q8_0_tensor(qg_gpu, mf.map, mf.size,

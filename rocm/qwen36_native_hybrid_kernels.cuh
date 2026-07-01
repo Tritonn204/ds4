@@ -66,6 +66,13 @@ static inline float stub_silu(float x) { return x / (1.0f + expf(-x)); }
 static inline float stub_sigmoid(float x) { return 1.0f / (1.0f + expf(-x)); }
 static inline float stub_softplus(float x) { return log1pf(expf(x)); }
 
+static int env_flag_enabled_default1(const char *name) {
+    const char *v = getenv(name);
+    if (!v || !v[0]) return 1;
+    if (strcmp(v, "0") == 0) return 0;
+    return 1;
+}
+
 static void stub_deltanet_head_step(float *state,
                                      uint32_t head_k_dim,
                                      uint32_t head_v_dim,
@@ -442,6 +449,38 @@ int ds4_gpu_state_norm_silu_reorder_tensor(
         const float *ssm_norm_w)
 {
     const uint64_t vdim_bytes = (uint64_t)num_v_heads * head_v_dim * sizeof(float);
+    static int gpu_path_cached = -1;
+    if (gpu_path_cached == -1) gpu_path_cached = env_flag_enabled_default1("QWEN36_NATIVE_HYBRID_GPU_STATE_NORM");
+    if (!gpu_path_cached) {
+        uint32_t h, vd;
+        float *core = (float *)malloc(vdim_bytes);
+        float *z_hf = (float *)malloc(vdim_bytes);
+        float *out_in_hf = (float *)malloc(vdim_bytes);
+        float *out_in_gg = (float *)malloc(vdim_bytes);
+        if (!core || !z_hf || !out_in_hf || !out_in_gg) goto cpu_cleanup;
+        if (ds4_gpu_tensor_read(core_gpu, 0, core, vdim_bytes) == 0 ||
+            ds4_gpu_tensor_read(z_gpu, 0, z_hf, vdim_bytes) == 0) goto cpu_cleanup;
+        for (h = 0; h < num_v_heads; ++h) {
+            size_t base = (size_t)h * head_v_dim;
+            double var = 0.0;
+            for (vd = 0; vd < head_v_dim; ++vd) {
+                double cv = core[base + vd];
+                var += cv * cv;
+            }
+            var /= (double)head_v_dim;
+            for (vd = 0; vd < head_v_dim; ++vd) {
+                float cv = core[base + vd];
+                out_in_hf[base + vd] = (float)(cv / sqrt(var + 1e-6)) * ssm_norm_w[vd] * stub_silu(z_hf[base + vd]);
+            }
+        }
+        stub_reorder_out_in_hftogg(out_in_gg, out_in_hf, num_v_heads, head_v_dim);
+        if (ds4_gpu_tensor_write(out_in_gg_gpu, 0, out_in_gg, vdim_bytes) == 0) goto cpu_cleanup;
+        free(core); free(z_hf); free(out_in_hf); free(out_in_gg);
+        return 1;
+cpu_cleanup:
+        free(core); free(z_hf); free(out_in_hf); free(out_in_gg);
+        return 0;
+    }
     ds4_gpu_tensor *ssm_norm_w_gpu = ds4_gpu_tensor_alloc((uint64_t)head_v_dim * sizeof(float));
     float *out_ptr = NULL, *core_ptr = NULL, *z_ptr = NULL, *norm_ptr = NULL;
     if (!ssm_norm_w_gpu) return 0;
@@ -480,6 +519,32 @@ int ds4_gpu_resid_post_ln_tensor(
         uint32_t hidden,
         const float *post_attn_norm_w)
 {
+    static int gpu_path_cached = -1;
+    if (gpu_path_cached == -1) gpu_path_cached = env_flag_enabled_default1("QWEN36_NATIVE_HYBRID_GPU_RESID_POST");
+    if (!gpu_path_cached) {
+        const uint64_t hidden_bytes = (uint64_t)hidden * sizeof(float);
+        uint32_t d;
+        float *layer_input = (float *)malloc(hidden_bytes);
+        float *out_proj = (float *)malloc(hidden_bytes);
+        float *resid = (float *)malloc(hidden_bytes);
+        float *post_ln = (float *)malloc(hidden_bytes);
+        if (!layer_input || !out_proj || !resid || !post_ln) goto cpu_cleanup;
+        if (ds4_gpu_tensor_read(layer_input_gpu, 0, layer_input, hidden_bytes) == 0 ||
+            ds4_gpu_tensor_read(out_proj_gpu, 0, out_proj, hidden_bytes) == 0) goto cpu_cleanup;
+        {
+            double var = 0.0;
+            for (d = 0; d < hidden; ++d) { resid[d] = layer_input[d] + out_proj[d]; var += (double)resid[d] * resid[d]; }
+            var /= (double)hidden;
+            for (d = 0; d < hidden; ++d) post_ln[d] = (float)(resid[d] / sqrt(var + 1e-6)) * post_attn_norm_w[d];
+        }
+        if (ds4_gpu_tensor_write(resid_gpu, 0, resid, hidden_bytes) == 0 ||
+            ds4_gpu_tensor_write(post_ln_gpu, 0, post_ln, hidden_bytes) == 0) goto cpu_cleanup;
+        free(layer_input); free(out_proj); free(resid); free(post_ln);
+        return 1;
+cpu_cleanup:
+        free(layer_input); free(out_proj); free(resid); free(post_ln);
+        return 0;
+    }
     ds4_gpu_tensor *post_attn_norm_w_gpu = ds4_gpu_tensor_alloc((uint64_t)hidden * sizeof(float));
     float *resid_ptr = NULL, *post_ptr = NULL, *in_ptr = NULL, *proj_ptr = NULL, *w_ptr = NULL;
     const uint32_t block = 256u;

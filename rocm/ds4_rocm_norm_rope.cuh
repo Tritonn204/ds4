@@ -44,6 +44,29 @@ __global__ static void rms_norm_weight_kernel(float *out, const float *x, const 
     }
 }
 
+__global__ static void rms_norm_weight_plus1_kernel(float *out, const float *x, const float *w, uint32_t n, uint32_t rows, float eps) {
+    uint32_t row = blockIdx.x;
+    if (row >= rows) return;
+    const float *xr = x + (uint64_t)row * n;
+    float *orow = out + (uint64_t)row * n;
+    float sum = 0.0f;
+    for (uint32_t i = threadIdx.x; i < n; i += blockDim.x) {
+        float v = xr[i];
+        sum += v * v;
+    }
+    __shared__ float partial[256];
+    partial[threadIdx.x] = sum;
+    __syncthreads();
+    for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) partial[threadIdx.x] += partial[threadIdx.x + stride];
+        __syncthreads();
+    }
+    float scale = rsqrtf(partial[0] / (float)n + eps);
+    for (uint32_t i = threadIdx.x; i < n; i += blockDim.x) {
+        orow[i] = xr[i] * scale * (1.0f + w[i]);
+    }
+}
+
 __global__ static void dsv4_qkv_rms_norm_rows_kernel(
         float *q_out,
         const float *q,
@@ -446,6 +469,19 @@ extern "C" int ds4_gpu_rms_norm_weight_rows_tensor(ds4_gpu_tensor *out, const ds
     const float *w = (const float *)wptr;
     rms_norm_weight_kernel<<<rows, 256>>>((float *)out->ptr, (const float *)x->ptr, w, n, rows, eps);
     return cuda_ok(cudaGetLastError(), "rms_norm_weight launch");
+}
+extern "C" int ds4_gpu_rms_norm_weight_plus1_rows_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *x, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint32_t n, uint32_t rows, float eps) {
+    uint64_t weight_bytes = 0;
+    if (!model_map || !cuda_u64_mul_checked(n, sizeof(float), &weight_bytes) ||
+        !cuda_model_range_fits(model_size, weight_offset, weight_bytes) ||
+        !cuda_tensor_has_elems2(out, n, rows, sizeof(float)) ||
+        !cuda_tensor_has_elems2(x, n, rows, sizeof(float))) return 0;
+    if (n == 0u || rows == 0u) return 1;
+    const char *wptr = cuda_model_range_ptr(model_map, weight_offset, weight_bytes, "rms_weight_plus1");
+    if (!wptr) return 0;
+    const float *w = (const float *)wptr;
+    rms_norm_weight_plus1_kernel<<<rows, 256>>>((float *)out->ptr, (const float *)x->ptr, w, n, rows, eps);
+    return cuda_ok(cudaGetLastError(), "rms_norm_weight_plus1 launch");
 }
 extern "C" int ds4_gpu_dsv4_qkv_rms_norm_rows_tensor(
         ds4_gpu_tensor       *q_out,

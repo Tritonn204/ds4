@@ -231,6 +231,13 @@ static void rmsnorm_weight_plus1(const float *in, float *out, const float *w, ui
     for (uint32_t i = 0; i < dim; ++i) out[i] = (float)(in[i] / sqrt(var + 1e-6)) * (1.0f + w[i]);
 }
 
+static void rmsnorm_weight_raw(const float *in, float *out, const float *w, uint32_t dim) {
+    double var = 0.0;
+    for (uint32_t i = 0; i < dim; ++i) var += (double)in[i] * in[i];
+    var /= (double)dim;
+    for (uint32_t i = 0; i < dim; ++i) out[i] = (float)(in[i] / sqrt(var + 1e-6)) * w[i];
+}
+
 static int run_gpu_ffn_from_residual(
         const mapped_file *mf,
         const qwen36_35a3b_q8_layer *layer,
@@ -539,12 +546,12 @@ static int run_prefill_full_layer(worker_state *ws, const float *input_seq, uint
         for (uint32_t h = 0; h < NUM_HEADS; ++h) {
             const float *src = qg + (size_t)t * (ATTN_GATE_DIM * 2u) + (size_t)h * (HEAD_DIM * 2u);
             float *qdst = q_all + ((size_t)t * NUM_HEADS + h) * HEAD_DIM;
-            rmsnorm_weight_plus1(src, qdst, ws->cache.q_norm_w, HEAD_DIM);
+            rmsnorm_weight_raw(src, qdst, ws->cache.q_norm_w, HEAD_DIM);
             memcpy(gate_all + (size_t)t * ATTN_GATE_DIM + (size_t)h * HEAD_DIM, src + HEAD_DIM, HEAD_DIM * sizeof(float));
         }
         for (uint32_t h = 0; h < NUM_KV_HEADS; ++h) {
-            rmsnorm_weight_plus1(kk + (size_t)t * NUM_KV_HEADS * HEAD_DIM + (size_t)h * HEAD_DIM,
-                                 k_all + ((size_t)t * NUM_KV_HEADS + h) * HEAD_DIM, ws->cache.k_norm_w, HEAD_DIM);
+            rmsnorm_weight_raw(kk + (size_t)t * NUM_KV_HEADS * HEAD_DIM + (size_t)h * HEAD_DIM,
+                               k_all + ((size_t)t * NUM_KV_HEADS + h) * HEAD_DIM, ws->cache.k_norm_w, HEAD_DIM);
             memcpy(v_all + ((size_t)t * NUM_KV_HEADS + h) * HEAD_DIM,
                    vv + (size_t)t * NUM_KV_HEADS * HEAD_DIM + (size_t)h * HEAD_DIM, HEAD_DIM * sizeof(float));
         }
@@ -677,11 +684,11 @@ static int run_step_full_layer(worker_state *ws, const float *input_row) {
     for (uint32_t h = 0; h < NUM_HEADS; ++h) {
         const float *src = qg + (size_t)h * (HEAD_DIM * 2u);
         float *qdst = q_cur + (size_t)h * HEAD_DIM;
-        rmsnorm_weight_plus1(src, qdst, ws->cache.q_norm_w, HEAD_DIM);
+        rmsnorm_weight_raw(src, qdst, ws->cache.q_norm_w, HEAD_DIM);
         memcpy(gate_cur + (size_t)h * HEAD_DIM, src + HEAD_DIM, HEAD_DIM * sizeof(float));
     }
     for (uint32_t h = 0; h < NUM_KV_HEADS; ++h) {
-        rmsnorm_weight_plus1(kk + (size_t)h * HEAD_DIM, k_cur + (size_t)h * HEAD_DIM, ws->cache.k_norm_w, HEAD_DIM);
+        rmsnorm_weight_raw(kk + (size_t)h * HEAD_DIM, k_cur + (size_t)h * HEAD_DIM, ws->cache.k_norm_w, HEAD_DIM);
         memcpy(v_cur + (size_t)h * HEAD_DIM, vv + (size_t)h * HEAD_DIM, HEAD_DIM * sizeof(float));
     }
     for (uint32_t h = 0; h < NUM_KV_HEADS; ++h) apply_rope_one_inplace(k_cur + (size_t)h * HEAD_DIM, pos);

@@ -327,31 +327,31 @@ static void reorder_qkv_v_tokenmajor_gg_to_hf(
         const float *src,
         uint32_t seq_len,
         uint32_t key_dim,
-        uint32_t n_heads,
-        uint32_t head_dim) {
-    uint32_t *gg_to_hf = (uint32_t *)malloc((size_t)n_heads * sizeof(uint32_t));
-    uint32_t *hf_to_gg = (uint32_t *)malloc((size_t)n_heads * sizeof(uint32_t));
-    const uint32_t value_dim = n_heads * head_dim;
+        uint32_t num_v_heads,
+        uint32_t head_v_dim) {
+    uint32_t *gg_to_hf_v = (uint32_t *)malloc((size_t)num_v_heads * sizeof(uint32_t));
+    uint32_t *hf_to_gg_v = (uint32_t *)malloc((size_t)num_v_heads * sizeof(uint32_t));
+    const uint32_t value_dim = num_v_heads * head_v_dim;
     const uint32_t qkv_dim = key_dim * 2u + value_dim;
     const uint32_t v_off = key_dim * 2u;
-    if (!gg_to_hf || !hf_to_gg) {
-        free(gg_to_hf);
-        free(hf_to_gg);
+    if (!gg_to_hf_v || !hf_to_gg_v) {
+        free(gg_to_hf_v);
+        free(hf_to_gg_v);
         return;
     }
-    build_perms(n_heads, gg_to_hf, hf_to_gg);
+    build_perms(num_v_heads, gg_to_hf_v, hf_to_gg_v);
     for (uint32_t t = 0; t < seq_len; ++t) {
         const float *src_row = src + (size_t)t * qkv_dim;
         float *dst_row = dst + (size_t)t * qkv_dim;
         memcpy(dst_row, src_row, (size_t)(key_dim * 2u) * sizeof(float));
-        for (uint32_t h = 0; h < n_heads; ++h) {
-            memcpy(dst_row + v_off + (size_t)h * head_dim,
-                   src_row + v_off + (size_t)hf_to_gg[h] * head_dim,
-                   (size_t)head_dim * sizeof(float));
+        for (uint32_t h = 0; h < num_v_heads; ++h) {
+            memcpy(dst_row + v_off + (size_t)h * head_v_dim,
+                   src_row + v_off + (size_t)hf_to_gg_v[h] * head_v_dim,
+                   (size_t)head_v_dim * sizeof(float));
         }
     }
-    free(gg_to_hf);
-    free(hf_to_gg);
+    free(gg_to_hf_v);
+    free(hf_to_gg_v);
 }
 
 static void reorder_out_in_hf_to_gg(float *dst, const float *src, uint32_t seq_len, uint32_t n_heads, uint32_t head_dim) {
@@ -744,7 +744,9 @@ static int run_gpu_hybrid_dynamic(
     reorder_head_rows_seq_f32(z, z_raw, n_tokens, fx->num_v_heads, fx->head_v_dim);
     reorder_head_scalars_seq_f32(a, a_raw, n_tokens, fx->num_v_heads);
     reorder_head_scalars_seq_f32(b, b_raw, n_tokens, fx->num_v_heads);
-    reorder_qkv_v_tokenmajor_gg_to_hf(qkv, qkv_raw, n_tokens, fx->key_dim, fx->num_v_heads, fx->head_v_dim);
+    reorder_qkv_v_tokenmajor_gg_to_hf(qkv, qkv_raw, n_tokens,
+                                      fx->key_dim,
+                                      fx->num_v_heads, fx->head_v_dim);
     if (have_trace_seq) {
         printf("qkv_reordered_rmse: %.8f\n", rmse(qkv, fx->qkv_seq, (size_t)n_tokens * qkv_dim));
         printf("qkv_reordered_cosine: %.8f\n", cosine(qkv, fx->qkv_seq, (size_t)n_tokens * qkv_dim));

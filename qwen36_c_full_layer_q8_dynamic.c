@@ -172,6 +172,13 @@ static void rmsnorm_weight_plus1(const float *in, float *out, const float *w, ui
     for (uint32_t i = 0; i < dim; ++i) out[i] = (float)(in[i] / sqrt(var + 1e-6)) * (1.0f + w[i]);
 }
 
+static void rmsnorm_weight_raw(const float *in, float *out, const float *w, uint32_t dim) {
+    double var = 0.0;
+    for (uint32_t i = 0; i < dim; ++i) var += (double)in[i] * in[i];
+    var /= (double)dim;
+    for (uint32_t i = 0; i < dim; ++i) out[i] = (float)(in[i] / sqrt(var + 1e-6)) * w[i];
+}
+
 static int ensure_expert_loaded(const qwen36_gguf_file *gf, const qwen36_35a3b_q8_layer *layer, full_layer_cache *cache, uint32_t expert_id, char *err, size_t err_cap) {
     expert_cache_entry *e = &cache->experts[expert_id];
     if (e->loaded) return 1;
@@ -305,7 +312,7 @@ int main(int argc, char **argv) {
             return 1;
         }
         for (uint32_t t = 0; t < seq_len; ++t) {
-            rmsnorm_weight_plus1(input_seq + (size_t)t * HIDDEN, attn_in + (size_t)t * HIDDEN, cache.attn_norm_w, HIDDEN);
+            rmsnorm_weight_raw(input_seq + (size_t)t * HIDDEN, attn_in + (size_t)t * HIDDEN, cache.attn_norm_w, HIDDEN);
             matvec(cache.q_proj_w, attn_in + (size_t)t * HIDDEN, qg, ATTN_GATE_DIM * 2u, HIDDEN);
             matvec(cache.k_proj_w, attn_in + (size_t)t * HIDDEN, kk, NUM_KV_HEADS * HEAD_DIM, HIDDEN);
             matvec(cache.v_proj_w, attn_in + (size_t)t * HIDDEN, vv, NUM_KV_HEADS * HEAD_DIM, HIDDEN);
@@ -352,7 +359,7 @@ int main(int argc, char **argv) {
             }
             matvec(cache.o_proj_w, attn_out_flat + (size_t)t * ATTN_GATE_DIM, proj_out + (size_t)t * HIDDEN, HIDDEN, ATTN_GATE_DIM);
             for (uint32_t d = 0; d < HIDDEN; ++d) output_seq[(size_t)t * HIDDEN + d] = input_seq[(size_t)t * HIDDEN + d] + proj_out[(size_t)t * HIDDEN + d];
-            rmsnorm_weight_plus1(output_seq + (size_t)t * HIDDEN, post_ln + (size_t)t * HIDDEN, cache.post_attn_norm_w, HIDDEN);
+            rmsnorm_weight_raw(output_seq + (size_t)t * HIDDEN, post_ln + (size_t)t * HIDDEN, cache.post_attn_norm_w, HIDDEN);
             memset(output_seq + (size_t)t * HIDDEN, 0, HIDDEN * sizeof(float));
             matvec(cache.router_w, post_ln + (size_t)t * HIDDEN, router_logits, ROUTER_COUNT, HIDDEN);
             topk_softmax256(router_logits, 8, router_idx, router_scores);

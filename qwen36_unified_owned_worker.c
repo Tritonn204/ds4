@@ -77,6 +77,30 @@ typedef struct full_layer_state {
     float *output_seq;
 } full_layer_state;
 
+typedef struct full_layer_dbg_scratch {
+    float input_row[FULL_HIDDEN];
+    float prev_out[FULL_HIDDEN];
+    float prev_k[FULL_NUM_KV_HEADS * FULL_HEAD_DIM];
+    float prev_v[FULL_NUM_KV_HEADS * FULL_HEAD_DIM];
+    float attn_in[FULL_HIDDEN];
+    float qg[FULL_ATTN_GATE_DIM * 2u];
+    float kk[FULL_NUM_KV_HEADS * FULL_HEAD_DIM];
+    float vv[FULL_NUM_KV_HEADS * FULL_HEAD_DIM];
+    float q_cur[FULL_HEAD_DIM * FULL_NUM_HEADS];
+    float k_cur[FULL_HEAD_DIM * FULL_NUM_KV_HEADS];
+    float v_cur[FULL_HEAD_DIM * FULL_NUM_KV_HEADS];
+    float attn_out_flat[FULL_ATTN_GATE_DIM];
+    float proj_out[FULL_HIDDEN];
+    float residual[FULL_HIDDEN];
+    float post_ln[FULL_HIDDEN];
+    float router_logits[ROUTER_COUNT];
+    uint32_t router_idx[8];
+    float router_scores[8];
+    float shared_out[FULL_HIDDEN];
+    float routed_out[FULL_HIDDEN];
+    float final_out[FULL_HIDDEN];
+} full_layer_dbg_scratch;
+
 typedef struct layer_step_scratch {
     float *input_ln;
     float *qkv_raw;
@@ -148,9 +172,11 @@ static inline float sigmoidf_local(float x);
 static inline float softplusf_local(float x);
 static inline float siluf_local(float x);
 static void rmsnorm_weight_plus1(const float *in, float *out, const float *w, uint32_t dim);
+static void rmsnorm_weight_raw(const float *in, float *out, const float *w, uint32_t dim);
 static void apply_rope_one_inplace(float *x, uint32_t pos);
 static void matvec(const float *mat, const float *vec, float *out, uint32_t rows, uint32_t cols);
 static void topk_softmax256(const float *logits, uint32_t k, uint32_t *idx, float *scores);
+static int decode_q8_rows(const qwen36_gguf_file *gf, const qwen36_gguf_tensor *t, uint32_t row_idx, uint32_t nrows, uint32_t row_elems, float *out, char *err, size_t err_cap);
 static int ensure_expert_loaded(const qwen36_gguf_file *gf, const qwen36_35a3b_q8_layer *layer, expert_cache_entry *cache, uint32_t expert_id, uint32_t hidden, uint32_t inter, char *err, size_t err_cap);
 static void run_deltanet_head_step(float *state,
                                    uint32_t head_k_dim,
@@ -173,8 +199,32 @@ static int run_hybrid_layer_step_gpuproj(const live_fixture *fx,
                                          float *out_row,
                                          char *err,
                                          size_t err_cap);
+static int run_step_layer_dynamic(const live_fixture *fx,
+                                  const qwen36_gguf_file *gf,
+                                  const qwen36_35a3b_q8_layer *layer,
+                                  layer_runtime *ls,
+                                  const float *layer_input,
+                                  float *out_row,
+                                  char *err,
+                                  size_t err_cap);
 static int alloc_layer_step_scratch(const live_fixture *fx, layer_step_scratch *sc, char *err, size_t err_cap);
 static void free_layer_step_scratch(layer_step_scratch *sc);
+static int hybrid_dbg_enabled(uint32_t layer);
+static void hybrid_dbg_report_ring(uint32_t layer,
+                                   uint32_t step,
+                                   const char *stage,
+                                   const live_fixture *fx,
+                                   const layer_runtime *rt,
+                                   const float *write_qkv);
+static int clone_layer_runtime_for_debug(const live_fixture *fx,
+                                         const layer_runtime *src,
+                                         layer_runtime *dst,
+                                         char *err,
+                                         size_t err_cap);
+static void free_layer_runtime_debug(layer_runtime *rt);
+static int g_dbg_decode_step = -1;
+static int g_full_dbg_active = 0;
+static full_layer_dbg_scratch g_full_dbg_gpu;
 #ifdef QWEN36_UNIFIED_HAVE_GPU
 static int ensure_layer_gpu_step_scratch(const live_fixture *fx, layer_step_scratch *sc, char *err, size_t err_cap);
 #endif
@@ -207,11 +257,14 @@ struct unified_session_state {
     full_layer_small_cache *full_small_caches;
 #endif
     int verbose_logs;
+    uint32_t prefill_base_seq_len;
     uint32_t seq_len;
     uint32_t owned_cap;
     uint32_t hidden;
     uint32_t *token_ids;
     float *owned_seq;
+    float **cycle_pre_full_seqs;
+    float **cycle_owned_seqs;
     int prefilled;
 };
 
@@ -475,7 +528,7 @@ static int parse_config(const char *path, worker_config *cfg, char *err, size_t 
             cy = &cfg->cycles[cfg->n_cycles];
             memset(cy, 0, sizeof(*cy));
             cy->full_layer = (uint32_t)strtoul(layer_s, NULL, 10);
-            if (!split_csv(fixtures_s, &cy->fixtures, &cy->n_fixtures) || cy->n_fixtures == 0 || cy->n_fixtures > 3) {
+            if (!split_csv(fixtures_s, &cy->fixtures, &cy->n_fixtures) || cy->n_fixtures == 0) {
                 snprintf(err, err_cap, "bad cycle fixtures");
                 fclose(fp);
                 return 0;
@@ -685,6 +738,14 @@ static void rmsnorm_weight_plus1(const float *in, float *out, const float *w, ui
     for (i = 0; i < dim; ++i) out[i] = (float)(in[i] / sqrt(var + 1e-6)) * (1.0f + w[i]);
 }
 
+static void rmsnorm_weight_raw(const float *in, float *out, const float *w, uint32_t dim) {
+    double var = 0.0;
+    uint32_t i;
+    for (i = 0; i < dim; ++i) var += (double)in[i] * in[i];
+    var /= (double)dim;
+    for (i = 0; i < dim; ++i) out[i] = (float)(in[i] / sqrt(var + 1e-6)) * w[i];
+}
+
 static void apply_rope_one_inplace(float *x, uint32_t pos) {
     float tmp[FULL_ROTARY_DIM];
     apply_rope_inplace(x, tmp, pos);
@@ -805,16 +866,16 @@ static int run_full_layer_prefill_cpu(const qwen36_35a3b_q8_layer *layer,
         goto fail;
     }
     for (t = 0; t < seq_len; ++t) {
-        rmsnorm_weight_plus1(input_seq + (size_t)t * FULL_HIDDEN, attn_in + (size_t)t * FULL_HIDDEN, cache->attn_norm_w, FULL_HIDDEN);
+        rmsnorm_weight_raw(input_seq + (size_t)t * FULL_HIDDEN, attn_in + (size_t)t * FULL_HIDDEN, cache->attn_norm_w, FULL_HIDDEN);
         matvec(cache->q_proj_w, attn_in + (size_t)t * FULL_HIDDEN, qg, FULL_ATTN_GATE_DIM * 2u, FULL_HIDDEN);
         matvec(cache->k_proj_w, attn_in + (size_t)t * FULL_HIDDEN, kk, FULL_NUM_KV_HEADS * FULL_HEAD_DIM, FULL_HIDDEN);
         matvec(cache->v_proj_w, attn_in + (size_t)t * FULL_HIDDEN, vv, FULL_NUM_KV_HEADS * FULL_HEAD_DIM, FULL_HIDDEN);
         for (h = 0; h < FULL_NUM_HEADS; ++h) {
-            rmsnorm_weight_plus1(qg + (size_t)h * (FULL_HEAD_DIM * 2u), q_all + ((size_t)t * FULL_NUM_HEADS + h) * FULL_HEAD_DIM, cache->q_norm_w, FULL_HEAD_DIM);
+            rmsnorm_weight_raw(qg + (size_t)h * (FULL_HEAD_DIM * 2u), q_all + ((size_t)t * FULL_NUM_HEADS + h) * FULL_HEAD_DIM, cache->q_norm_w, FULL_HEAD_DIM);
             memcpy(gate_all + (size_t)t * FULL_ATTN_GATE_DIM + (size_t)h * FULL_HEAD_DIM, qg + (size_t)h * (FULL_HEAD_DIM * 2u) + FULL_HEAD_DIM, FULL_HEAD_DIM * sizeof(float));
         }
         for (h = 0; h < FULL_NUM_KV_HEADS; ++h) {
-            rmsnorm_weight_plus1(kk + (size_t)h * FULL_HEAD_DIM, k_all + ((size_t)t * FULL_NUM_KV_HEADS + h) * FULL_HEAD_DIM, cache->k_norm_w, FULL_HEAD_DIM);
+            rmsnorm_weight_raw(kk + (size_t)h * FULL_HEAD_DIM, k_all + ((size_t)t * FULL_NUM_KV_HEADS + h) * FULL_HEAD_DIM, cache->k_norm_w, FULL_HEAD_DIM);
             memcpy(v_all + ((size_t)t * FULL_NUM_KV_HEADS + h) * FULL_HEAD_DIM, vv + (size_t)h * FULL_HEAD_DIM, FULL_HEAD_DIM * sizeof(float));
         }
         for (h = 0; h < FULL_NUM_HEADS; ++h) {
@@ -852,7 +913,7 @@ static int run_full_layer_prefill_cpu(const qwen36_35a3b_q8_layer *layer,
         }
         matvec(cache->o_proj_w, attn_out_flat + (size_t)t * FULL_ATTN_GATE_DIM, proj_out + (size_t)t * FULL_HIDDEN, FULL_HIDDEN, FULL_ATTN_GATE_DIM);
         for (d = 0; d < FULL_HIDDEN; ++d) state->output_seq[(size_t)t * FULL_HIDDEN + d] = input_seq[(size_t)t * FULL_HIDDEN + d] + proj_out[(size_t)t * FULL_HIDDEN + d];
-        rmsnorm_weight_plus1(state->output_seq + (size_t)t * FULL_HIDDEN, post_ln + (size_t)t * FULL_HIDDEN, cache->post_attn_norm_w, FULL_HIDDEN);
+        rmsnorm_weight_raw(state->output_seq + (size_t)t * FULL_HIDDEN, post_ln + (size_t)t * FULL_HIDDEN, cache->post_attn_norm_w, FULL_HIDDEN);
         memset(state->output_seq + (size_t)t * FULL_HIDDEN, 0, FULL_HIDDEN * sizeof(float));
         matvec(cache->router_w, post_ln + (size_t)t * FULL_HIDDEN, router_logits, ROUTER_COUNT, FULL_HIDDEN);
         topk_softmax256(router_logits, 8, router_idx, router_scores);
@@ -929,22 +990,25 @@ static int run_full_layer_step_cpu(const qwen36_35a3b_q8_layer *layer,
     uint32_t pos, h, d, vd, i;
     if (!ensure_full_layer_loaded(gf, layer, cache, err, err_cap)) return 0;
     pos = state->seq_len;
-    rmsnorm_weight_plus1(input_row, attn_in, cache->attn_norm_w, FULL_HIDDEN);
+    rmsnorm_weight_raw(input_row, attn_in, cache->attn_norm_w, FULL_HIDDEN);
     matvec(cache->q_proj_w, attn_in, qg, FULL_ATTN_GATE_DIM * 2u, FULL_HIDDEN);
     matvec(cache->k_proj_w, attn_in, kk, FULL_NUM_KV_HEADS * FULL_HEAD_DIM, FULL_HIDDEN);
     matvec(cache->v_proj_w, attn_in, vv, FULL_NUM_KV_HEADS * FULL_HEAD_DIM, FULL_HIDDEN);
     for (h = 0; h < FULL_NUM_HEADS; ++h) {
-        rmsnorm_weight_plus1(qg + (size_t)h * (FULL_HEAD_DIM * 2u), q_cur + (size_t)h * FULL_HEAD_DIM, cache->q_norm_w, FULL_HEAD_DIM);
+        rmsnorm_weight_raw(qg + (size_t)h * (FULL_HEAD_DIM * 2u), q_cur + (size_t)h * FULL_HEAD_DIM, cache->q_norm_w, FULL_HEAD_DIM);
         memcpy(gate_cur + (size_t)h * FULL_HEAD_DIM, qg + (size_t)h * (FULL_HEAD_DIM * 2u) + FULL_HEAD_DIM, FULL_HEAD_DIM * sizeof(float));
     }
     for (h = 0; h < FULL_NUM_KV_HEADS; ++h) {
-        rmsnorm_weight_plus1(kk + (size_t)h * FULL_HEAD_DIM, k_cur + (size_t)h * FULL_HEAD_DIM, cache->k_norm_w, FULL_HEAD_DIM);
+        rmsnorm_weight_raw(kk + (size_t)h * FULL_HEAD_DIM, k_cur + (size_t)h * FULL_HEAD_DIM, cache->k_norm_w, FULL_HEAD_DIM);
         memcpy(v_cur + (size_t)h * FULL_HEAD_DIM, vv + (size_t)h * FULL_HEAD_DIM, FULL_HEAD_DIM * sizeof(float));
     }
+    for (h = 0; h < FULL_NUM_KV_HEADS; ++h) {
+        float dummy_q[FULL_HEAD_DIM] = {0};
+        apply_rope_inplace(dummy_q, k_cur + (size_t)h * FULL_HEAD_DIM, pos);
+    }
     for (h = 0; h < FULL_NUM_HEADS; ++h) {
-        apply_rope_inplace(q_cur + (size_t)h * FULL_HEAD_DIM,
-                           k_cur + (size_t)(h / (FULL_NUM_HEADS / FULL_NUM_KV_HEADS)) * FULL_HEAD_DIM,
-                           pos);
+        float dummy_k[FULL_HEAD_DIM] = {0};
+        apply_rope_inplace(q_cur + (size_t)h * FULL_HEAD_DIM, dummy_k, pos);
     }
     memset(attn_out_flat, 0, sizeof(attn_out_flat));
     for (h = 0; h < FULL_NUM_HEADS; ++h) {
@@ -973,7 +1037,7 @@ static int run_full_layer_step_cpu(const qwen36_35a3b_q8_layer *layer,
     }
     matvec(cache->o_proj_w, attn_out_flat, proj_out, FULL_HIDDEN, FULL_ATTN_GATE_DIM);
     for (d = 0; d < FULL_HIDDEN; ++d) out_row[d] = input_row[d] + proj_out[d];
-    rmsnorm_weight_plus1(out_row, post_ln, cache->post_attn_norm_w, FULL_HIDDEN);
+    rmsnorm_weight_raw(out_row, post_ln, cache->post_attn_norm_w, FULL_HIDDEN);
     memset(out_row, 0, (size_t)FULL_HIDDEN * sizeof(float));
     matvec(cache->router_w, post_ln, router_logits, ROUTER_COUNT, FULL_HIDDEN);
     topk_softmax256(router_logits, 8, router_idx, router_scores);
@@ -1001,6 +1065,191 @@ static int run_full_layer_step_cpu(const qwen36_35a3b_q8_layer *layer,
     memcpy(state->output_seq + (size_t)pos * FULL_HIDDEN, out_row, (size_t)FULL_HIDDEN * sizeof(float));
     state->seq_len = pos + 1u;
     return 1;
+}
+
+static int run_full_layer_step_cpu_debug(const qwen36_35a3b_q8_layer *layer,
+                                         full_layer_cache *cache,
+                                         full_layer_state *state,
+                                         const qwen36_gguf_file *gf,
+                                         const float *input_row,
+                                         float *out_row,
+                                         full_layer_dbg_scratch *dbg,
+                                         char *err,
+                                         size_t err_cap) {
+    float *gate = NULL;
+    float *up = NULL;
+    float *act = NULL;
+    float *down = NULL;
+    float *shared_gate = NULL;
+    float *shared_up = NULL;
+    float *shared_act = NULL;
+    float *shared = NULL;
+    uint32_t pos, h, d, vd, i;
+    gate = (float *)malloc((size_t)FULL_INTER * sizeof(float));
+    up = (float *)malloc((size_t)FULL_INTER * sizeof(float));
+    act = (float *)malloc((size_t)FULL_INTER * sizeof(float));
+    down = (float *)malloc((size_t)FULL_HIDDEN * sizeof(float));
+    shared_gate = (float *)malloc((size_t)FULL_INTER * sizeof(float));
+    shared_up = (float *)malloc((size_t)FULL_INTER * sizeof(float));
+    shared_act = (float *)malloc((size_t)FULL_INTER * sizeof(float));
+    shared = (float *)malloc((size_t)FULL_HIDDEN * sizeof(float));
+    if (!gate || !up || !act || !down || !shared_gate || !shared_up || !shared_act || !shared) {
+        snprintf(err, err_cap, "oom full debug temps");
+        goto fail;
+    }
+    if (g_full_dbg_active) {
+        fprintf(stderr, "=== DBG_FULL_CPU step=%u PHASE=LOAD\n", (uint32_t)g_dbg_decode_step);
+        fflush(stderr);
+    }
+    if (!ensure_full_layer_loaded(gf, layer, cache, err, err_cap)) return 0;
+    memset(dbg, 0, sizeof(*dbg));
+    pos = state->seq_len;
+    if (g_full_dbg_active) {
+        fprintf(stderr, "=== DBG_FULL_CPU step=%u PHASE=PROJ\n", (uint32_t)g_dbg_decode_step);
+        fflush(stderr);
+    }
+    rmsnorm_weight_raw(input_row, dbg->attn_in, cache->attn_norm_w, FULL_HIDDEN);
+    matvec(cache->q_proj_w, dbg->attn_in, dbg->qg, FULL_ATTN_GATE_DIM * 2u, FULL_HIDDEN);
+    matvec(cache->k_proj_w, dbg->attn_in, dbg->kk, FULL_NUM_KV_HEADS * FULL_HEAD_DIM, FULL_HIDDEN);
+    matvec(cache->v_proj_w, dbg->attn_in, dbg->vv, FULL_NUM_KV_HEADS * FULL_HEAD_DIM, FULL_HIDDEN);
+    for (h = 0; h < FULL_NUM_HEADS; ++h) {
+        rmsnorm_weight_raw(dbg->qg + (size_t)h * (FULL_HEAD_DIM * 2u),
+                           dbg->q_cur + (size_t)h * FULL_HEAD_DIM,
+                           cache->q_norm_w,
+                           FULL_HEAD_DIM);
+    }
+    for (h = 0; h < FULL_NUM_KV_HEADS; ++h) {
+        rmsnorm_weight_raw(dbg->kk + (size_t)h * FULL_HEAD_DIM,
+                           dbg->k_cur + (size_t)h * FULL_HEAD_DIM,
+                           cache->k_norm_w,
+                           FULL_HEAD_DIM);
+        memcpy(dbg->v_cur + (size_t)h * FULL_HEAD_DIM,
+               dbg->vv + (size_t)h * FULL_HEAD_DIM,
+               FULL_HEAD_DIM * sizeof(float));
+    }
+    if (g_full_dbg_active) {
+        fprintf(stderr, "=== DBG_FULL_CPU step=%u PHASE=ROPE\n", (uint32_t)g_dbg_decode_step);
+        fflush(stderr);
+    }
+    for (h = 0; h < FULL_NUM_KV_HEADS; ++h) {
+        float dummy_q[FULL_HEAD_DIM] = {0};
+        apply_rope_inplace(dummy_q,
+                           dbg->k_cur + (size_t)h * FULL_HEAD_DIM,
+                           pos);
+    }
+    for (h = 0; h < FULL_NUM_HEADS; ++h) {
+        float dummy_k[FULL_HEAD_DIM] = {0};
+        apply_rope_inplace(dbg->q_cur + (size_t)h * FULL_HEAD_DIM,
+                           dummy_k,
+                           pos);
+    }
+    if (g_full_dbg_active) {
+        fprintf(stderr, "=== DBG_FULL_CPU step=%u PHASE=ATTN\n", (uint32_t)g_dbg_decode_step);
+        fflush(stderr);
+    }
+    memset(dbg->attn_out_flat, 0, sizeof(dbg->attn_out_flat));
+    for (h = 0; h < FULL_NUM_HEADS; ++h) {
+        const uint32_t kvh = h / (FULL_NUM_HEADS / FULL_NUM_KV_HEADS);
+        double scores[8192];
+        double maxv = -1e300, sum = 0.0;
+        float *out = dbg->attn_out_flat + (size_t)h * FULL_HEAD_DIM;
+        const float *qv = dbg->q_cur + (size_t)h * FULL_HEAD_DIM;
+        for (uint32_t s = 0; s <= pos; ++s) {
+            const float *kv = (s == pos) ? (dbg->k_cur + (size_t)kvh * FULL_HEAD_DIM) : (state->k_all + ((size_t)s * FULL_NUM_KV_HEADS + kvh) * FULL_HEAD_DIM);
+            double dot = 0.0;
+            for (d = 0; d < FULL_HEAD_DIM; ++d) dot += (double)qv[d] * kv[d];
+            scores[s] = dot / sqrt((double)FULL_HEAD_DIM);
+            if (scores[s] > maxv) maxv = scores[s];
+        }
+        for (uint32_t s = 0; s <= pos; ++s) {
+            scores[s] = exp(scores[s] - maxv);
+            sum += scores[s];
+        }
+        for (uint32_t s = 0; s <= pos; ++s) {
+            const float w = (float)(scores[s] / sum);
+            const float *vvh = (s == pos) ? (dbg->v_cur + (size_t)kvh * FULL_HEAD_DIM) : (state->v_all + ((size_t)s * FULL_NUM_KV_HEADS + kvh) * FULL_HEAD_DIM);
+            for (d = 0; d < FULL_HEAD_DIM; ++d) out[d] += w * vvh[d];
+        }
+        for (d = 0; d < FULL_HEAD_DIM; ++d) out[d] *= sigmoidf_local(dbg->qg[(size_t)h * (FULL_HEAD_DIM * 2u) + FULL_HEAD_DIM + d]);
+    }
+    if (g_full_dbg_active) {
+        fprintf(stderr, "=== DBG_FULL_CPU step=%u PHASE=POST_ATTN\n", (uint32_t)g_dbg_decode_step);
+        fflush(stderr);
+    }
+    matvec(cache->o_proj_w, dbg->attn_out_flat, dbg->proj_out, FULL_HIDDEN, FULL_ATTN_GATE_DIM);
+    for (d = 0; d < FULL_HIDDEN; ++d) dbg->residual[d] = input_row[d] + dbg->proj_out[d];
+    rmsnorm_weight_raw(dbg->residual, dbg->post_ln, cache->post_attn_norm_w, FULL_HIDDEN);
+    matvec(cache->router_w, dbg->post_ln, dbg->router_logits, ROUTER_COUNT, FULL_HIDDEN);
+    topk_softmax256(dbg->router_logits, 8, dbg->router_idx, dbg->router_scores);
+    memset(dbg->routed_out, 0, sizeof(dbg->routed_out));
+    if (g_full_dbg_active) {
+        fprintf(stderr, "=== DBG_FULL_CPU step=%u PHASE=EXPERTS\n", (uint32_t)g_dbg_decode_step);
+        fflush(stderr);
+    }
+    for (i = 0; i < 8; ++i) {
+        if (!ensure_full_expert_loaded(gf, layer, cache, dbg->router_idx[i], err, err_cap)) goto fail;
+        matvec(cache->experts[dbg->router_idx[i]].gate, dbg->post_ln, gate, FULL_INTER, FULL_HIDDEN);
+        matvec(cache->experts[dbg->router_idx[i]].up, dbg->post_ln, up, FULL_INTER, FULL_HIDDEN);
+        for (vd = 0; vd < FULL_INTER; ++vd) act[vd] = siluf_local(gate[vd]) * up[vd];
+        matvec(cache->experts[dbg->router_idx[i]].down, act, down, FULL_HIDDEN, FULL_INTER);
+        for (d = 0; d < FULL_HIDDEN; ++d) dbg->routed_out[d] += down[d] * dbg->router_scores[i];
+    }
+    matvec(cache->gate_shexp_w, dbg->post_ln, shared_gate, FULL_INTER, FULL_HIDDEN);
+    matvec(cache->up_shexp_w, dbg->post_ln, shared_up, FULL_INTER, FULL_HIDDEN);
+    for (vd = 0; vd < FULL_INTER; ++vd) shared_act[vd] = siluf_local(shared_gate[vd]) * shared_up[vd];
+    matvec(cache->down_shexp_w, shared_act, shared, FULL_HIDDEN, FULL_INTER);
+    memcpy(dbg->shared_out, shared, (size_t)FULL_HIDDEN * sizeof(float));
+    if (g_full_dbg_active) {
+        fprintf(stderr, "=== DBG_FULL_CPU step=%u PHASE=FINAL\n", (uint32_t)g_dbg_decode_step);
+        fflush(stderr);
+    }
+    {
+        float s = 0.0f;
+        for (d = 0; d < FULL_HIDDEN; ++d) s += dbg->post_ln[d] * cache->gate_inp_shexp_w[d];
+        s = sigmoidf_local(s);
+        for (d = 0; d < FULL_HIDDEN; ++d) dbg->final_out[d] = input_row[d] + dbg->proj_out[d] + dbg->routed_out[d] + dbg->shared_out[d] * s;
+    }
+    if (g_full_dbg_active) {
+        fprintf(stderr, "=== DBG_FULL_CPU step=%u PHASE=OUT_COPY\n", (uint32_t)g_dbg_decode_step);
+        fflush(stderr);
+    }
+    memcpy(out_row, dbg->final_out, (size_t)FULL_HIDDEN * sizeof(float));
+    if (g_full_dbg_active) {
+        fprintf(stderr, "=== DBG_FULL_CPU step=%u PHASE=STATE_CAP\n", (uint32_t)g_dbg_decode_step);
+        fflush(stderr);
+    }
+    if (!ensure_full_layer_state_cap(state, pos + 1u, err, err_cap)) goto fail;
+    if (g_full_dbg_active) {
+        fprintf(stderr, "=== DBG_FULL_CPU step=%u PHASE=STATE_WRITE\n", (uint32_t)g_dbg_decode_step);
+        fflush(stderr);
+    }
+    memcpy(state->k_all + (size_t)pos * FULL_NUM_KV_HEADS * FULL_HEAD_DIM, dbg->k_cur, sizeof(dbg->k_cur));
+    memcpy(state->v_all + (size_t)pos * FULL_NUM_KV_HEADS * FULL_HEAD_DIM, dbg->v_cur, sizeof(dbg->v_cur));
+    memcpy(state->output_seq + (size_t)pos * FULL_HIDDEN, dbg->final_out, (size_t)FULL_HIDDEN * sizeof(float));
+    state->seq_len = pos + 1u;
+    if (g_full_dbg_active) {
+        fprintf(stderr, "=== DBG_FULL_CPU step=%u PHASE=DONE\n", (uint32_t)g_dbg_decode_step);
+        fflush(stderr);
+    }
+    free(gate);
+    free(up);
+    free(act);
+    free(down);
+    free(shared_gate);
+    free(shared_up);
+    free(shared_act);
+    free(shared);
+    return 1;
+fail:
+    free(gate);
+    free(up);
+    free(act);
+    free(down);
+    free(shared_gate);
+    free(shared_up);
+    free(shared_act);
+    free(shared);
+    return 0;
 }
 
 static int ensure_expert_loaded(const qwen36_gguf_file *gf, const qwen36_35a3b_q8_layer *layer, expert_cache_entry *cache, uint32_t expert_id, uint32_t hidden, uint32_t inter, char *err, size_t err_cap) {
@@ -1131,6 +1380,446 @@ static void free_layer_step_scratch(layer_step_scratch *sc) {
     memset(sc, 0, sizeof(*sc));
 }
 
+static int hybrid_dbg_enabled(uint32_t layer) {
+    static int init = 0;
+    static int enabled = 0;
+    static int all_layers = 0;
+    static uint32_t target_layer = 0;
+    static int step_start = -1;
+    static int step_end = -1;
+    if (!init) {
+        const char *env = getenv("QWEN36_DBG_HYBRID_LAYER");
+        const char *env_step_start = getenv("QWEN36_DBG_HYBRID_STEP_START");
+        const char *env_step_end = getenv("QWEN36_DBG_HYBRID_STEP_END");
+        if (env && env[0]) {
+            if (strcmp(env, "all") == 0) {
+                enabled = 1;
+                all_layers = 1;
+            } else {
+                char *endp = NULL;
+                unsigned long v = strtoul(env, &endp, 10);
+                if (endp && *endp == '\0') {
+                    enabled = 1;
+                    target_layer = (uint32_t)v;
+                }
+            }
+        }
+        if (env_step_start && env_step_start[0]) step_start = atoi(env_step_start);
+        if (env_step_end && env_step_end[0]) step_end = atoi(env_step_end);
+        init = 1;
+    }
+    if (!enabled) return 0;
+    if (step_start >= 0 && g_dbg_decode_step < step_start) return 0;
+    if (step_end >= 0 && g_dbg_decode_step > step_end) return 0;
+    return all_layers || layer == target_layer;
+}
+
+static void hybrid_dbg_report_diff(uint32_t layer, uint32_t step, const char *label,
+                                   const float *gpu, const float *cpu, size_t count) {
+    size_t i, max_idx = 0;
+    double sum_sq = 0.0, sum_abs = 0.0;
+    float max_abs = 0.0f;
+    for (i = 0; i < count; ++i) {
+        float d = fabsf(gpu[i] - cpu[i]);
+        if (d > max_abs) {
+            max_abs = d;
+            max_idx = i;
+        }
+        sum_sq += (double)d * (double)d;
+        sum_abs += (double)d;
+    }
+    fprintf(stderr,
+            "=== DBG_HYBRID[%u] step=%u %s rmse=%.8f max_diff=%.8f max_idx=%zu mean_abs=%.8f\n",
+            layer, step, label,
+            count ? sqrt(sum_sq / (double)count) : 0.0,
+            max_abs,
+            max_idx,
+            count ? (sum_abs / (double)count) : 0.0);
+    fflush(stderr);
+}
+
+static int boundary_dbg_enabled(void) {
+    static int init = 0;
+    static int enabled = 0;
+    static int step_start = -1;
+    static int step_end = -1;
+    if (!init) {
+        const char *env = getenv("QWEN36_DBG_BOUNDARY");
+        const char *env_step_start = getenv("QWEN36_DBG_HYBRID_STEP_START");
+        const char *env_step_end = getenv("QWEN36_DBG_HYBRID_STEP_END");
+        if (env && env[0] && strcmp(env, "0") != 0) enabled = 1;
+        if (env_step_start && env_step_start[0]) step_start = atoi(env_step_start);
+        if (env_step_end && env_step_end[0]) step_end = atoi(env_step_end);
+        init = 1;
+    }
+    if (!enabled) return 0;
+    if (step_start >= 0 && g_dbg_decode_step < step_start) return 0;
+    if (step_end >= 0 && g_dbg_decode_step > step_end) return 0;
+    return enabled;
+}
+
+static void boundary_dbg_report_diff(uint32_t step, const char *label,
+                                     const float *gpu, const float *cpu, size_t count) {
+    size_t i, max_idx = 0;
+    double sum_sq = 0.0, sum_abs = 0.0;
+    float max_abs = 0.0f;
+    for (i = 0; i < count; ++i) {
+        float d = fabsf(gpu[i] - cpu[i]);
+        if (d > max_abs) {
+            max_abs = d;
+            max_idx = i;
+        }
+        sum_sq += (double)d * (double)d;
+        sum_abs += (double)d;
+    }
+    fprintf(stderr,
+            "=== DBG_BOUNDARY step=%u %s rmse=%.8f max_diff=%.8f max_idx=%zu mean_abs=%.8f\n",
+            step, label,
+            count ? sqrt(sum_sq / (double)count) : 0.0,
+            max_abs,
+            max_idx,
+            count ? (sum_abs / (double)count) : 0.0);
+    fflush(stderr);
+}
+
+static void boundary_dbg_report_signature(uint32_t step, const char *label,
+                                          const float *vals, size_t count) {
+    size_t i;
+    const size_t head_n = count < 8 ? count : 8;
+    double sum = 0.0, sum_sq = 0.0;
+    float max_abs = 0.0f;
+    fprintf(stderr, "=== DBG_BOUNDARY_SIG step=%u %s", step, label);
+    for (i = 0; i < count; ++i) {
+        const float v = vals[i];
+        const float av = fabsf(v);
+        sum += (double)v;
+        sum_sq += (double)v * (double)v;
+        if (av > max_abs) max_abs = av;
+    }
+    fprintf(stderr, " mean=%.8f rms=%.8f max_abs=%.8f head=",
+            count ? (sum / (double)count) : 0.0,
+            count ? sqrt(sum_sq / (double)count) : 0.0,
+            max_abs);
+    for (i = 0; i < head_n; ++i) {
+        fprintf(stderr, "%s%.8f", i ? "," : "", (double)vals[i]);
+    }
+    fprintf(stderr, "\n");
+    fflush(stderr);
+}
+
+static void boundary_dbg_report_layer_runtime(uint32_t step,
+                                              uint32_t layer,
+                                              const live_fixture *fx,
+                                              const layer_runtime *rt) {
+    char label[32];
+    const size_t qkv_dim = (size_t)fx->key_dim * 2u + fx->value_dim;
+    const size_t state_elems = (size_t)fx->num_v_heads * fx->head_k_dim * fx->head_v_dim;
+    snprintf(label, sizeof(label), "L%u_DSTATE", layer);
+    boundary_dbg_report_signature(step, label, rt->deltanet_state, state_elems);
+    snprintf(label, sizeof(label), "L%u_CONV0", layer);
+    boundary_dbg_report_signature(step, label, rt->conv_ring[0], qkv_dim);
+    snprintf(label, sizeof(label), "L%u_CONV1", layer);
+    boundary_dbg_report_signature(step, label, rt->conv_ring[1], qkv_dim);
+    snprintf(label, sizeof(label), "L%u_CONV2", layer);
+    boundary_dbg_report_signature(step, label, rt->conv_ring[2], qkv_dim);
+}
+
+static void hybrid_dbg_report_signature(uint32_t layer,
+                                        uint32_t step,
+                                        const char *label,
+                                        const float *vals,
+                                        size_t count) {
+    size_t i;
+    const size_t head_n = count < 8 ? count : 8;
+    double sum = 0.0, sum_sq = 0.0;
+    float max_abs = 0.0f;
+    fprintf(stderr, "=== DBG_HYBRID_SIG[%u] step=%u %s", layer, step, label);
+    for (i = 0; i < count; ++i) {
+        const float v = vals[i];
+        const float av = fabsf(v);
+        sum += (double)v;
+        sum_sq += (double)v * (double)v;
+        if (av > max_abs) max_abs = av;
+    }
+    fprintf(stderr, " mean=%.8f rms=%.8f max_abs=%.8f head=",
+            count ? (sum / (double)count) : 0.0,
+            count ? sqrt(sum_sq / (double)count) : 0.0,
+            max_abs);
+    for (i = 0; i < head_n; ++i) {
+        fprintf(stderr, "%s%.8f", i ? "," : "", (double)vals[i]);
+    }
+    fprintf(stderr, "\n");
+    fflush(stderr);
+}
+
+static void hybrid_dbg_report_ring(uint32_t layer,
+                                   uint32_t step,
+                                   const char *stage,
+                                   const live_fixture *fx,
+                                   const layer_runtime *rt,
+                                   const float *write_qkv) {
+    char label[40];
+    const size_t qkv_dim = (size_t)fx->key_dim * 2u + fx->value_dim;
+    fprintf(stderr, "=== DBG_HYBRID_RING[%u] step=%u %s_COUNT=%u\n",
+            layer, step, stage, rt->conv_ring_count);
+    fflush(stderr);
+    snprintf(label, sizeof(label), "%s_CONV0", stage);
+    hybrid_dbg_report_signature(layer, step, label, rt->conv_ring[0], qkv_dim);
+    snprintf(label, sizeof(label), "%s_CONV1", stage);
+    hybrid_dbg_report_signature(layer, step, label, rt->conv_ring[1], qkv_dim);
+    snprintf(label, sizeof(label), "%s_CONV2", stage);
+    hybrid_dbg_report_signature(layer, step, label, rt->conv_ring[2], qkv_dim);
+    if (write_qkv) {
+        snprintf(label, sizeof(label), "%s_WRITE_QKV", stage);
+        hybrid_dbg_report_signature(layer, step, label, write_qkv, qkv_dim);
+    }
+}
+
+static int full_dbg_enabled(uint32_t layer) {
+    static int init = 0;
+    static int enabled = 0;
+    static int all_layers = 0;
+    static uint32_t target_layer = 0;
+    static int step_start = -1;
+    static int step_end = -1;
+    if (!init) {
+        const char *env = getenv("QWEN36_DBG_FULL_LAYER");
+        const char *env_step_start = getenv("QWEN36_DBG_FULL_STEP_START");
+        const char *env_step_end = getenv("QWEN36_DBG_FULL_STEP_END");
+        if (env && env[0]) {
+            if (strcmp(env, "all") == 0) {
+                enabled = 1;
+                all_layers = 1;
+            } else {
+                char *endp = NULL;
+                unsigned long v = strtoul(env, &endp, 10);
+                if (endp && *endp == '\0') {
+                    enabled = 1;
+                    target_layer = (uint32_t)v;
+                }
+            }
+        }
+        if (env_step_start && env_step_start[0]) step_start = atoi(env_step_start);
+        if (env_step_end && env_step_end[0]) step_end = atoi(env_step_end);
+        init = 1;
+    }
+    if (!enabled) return 0;
+    if (step_start >= 0 && g_dbg_decode_step < step_start) return 0;
+    if (step_end >= 0 && g_dbg_decode_step > step_end) return 0;
+    return all_layers || layer == target_layer;
+}
+
+static int full_dbg_breadcrumb_enabled(void) {
+    static int init = 0;
+    static int enabled = 0;
+    static int step_start = -1;
+    static int step_end = -1;
+    if (!init) {
+        const char *env = getenv("QWEN36_DBG_FULL_BREADCRUMB");
+        const char *env_step_start = getenv("QWEN36_DBG_FULL_STEP_START");
+        const char *env_step_end = getenv("QWEN36_DBG_FULL_STEP_END");
+        if (env && env[0] && strcmp(env, "0") != 0) enabled = 1;
+        if (env_step_start && env_step_start[0]) step_start = atoi(env_step_start);
+        if (env_step_end && env_step_end[0]) step_end = atoi(env_step_end);
+        init = 1;
+    }
+    if (!enabled) return 0;
+    if (step_start >= 0 && g_dbg_decode_step < step_start) return 0;
+    if (step_end >= 0 && g_dbg_decode_step > step_end) return 0;
+    return 1;
+}
+
+static int full_prefill_dbg_enabled(uint32_t layer) {
+    static int init = 0;
+    static int enabled = 0;
+    static int all_layers = 0;
+    static uint32_t target_layer = 0;
+    if (!init) {
+        const char *layer_env = getenv("QWEN36_DBG_FULL_LAYER");
+        const char *env = getenv("QWEN36_DBG_FULL_PREFILL");
+        if (env && env[0] && strcmp(env, "0") != 0) {
+            if (layer_env && layer_env[0]) {
+                if (strcmp(layer_env, "all") == 0) {
+                    enabled = 1;
+                    all_layers = 1;
+                } else {
+                    char *endp = NULL;
+                    unsigned long v = strtoul(layer_env, &endp, 10);
+                    if (endp && *endp == '\0') {
+                        enabled = 1;
+                        target_layer = (uint32_t)v;
+                    }
+                }
+            } else {
+                enabled = 1;
+                all_layers = 1;
+            }
+        }
+        init = 1;
+    }
+    if (!enabled) return 0;
+    return all_layers || layer == target_layer;
+}
+
+static void full_dbg_report_diff(uint32_t layer, uint32_t step, const char *label,
+                                 const float *gpu, const float *cpu, size_t count) {
+    size_t i, max_idx = 0;
+    double sum_sq = 0.0, sum_abs = 0.0;
+    float max_abs = 0.0f;
+    for (i = 0; i < count; ++i) {
+        float d = fabsf(gpu[i] - cpu[i]);
+        if (d > max_abs) {
+            max_abs = d;
+            max_idx = i;
+        }
+        sum_sq += (double)d * (double)d;
+        sum_abs += (double)d;
+    }
+    fprintf(stderr,
+            "=== DBG_FULL[%u] step=%u %s rmse=%.8f max_diff=%.8f max_idx=%zu mean_abs=%.8f\n",
+            layer, step, label,
+            count ? sqrt(sum_sq / (double)count) : 0.0,
+            max_abs, max_idx,
+            count ? (sum_abs / (double)count) : 0.0);
+    fflush(stderr);
+}
+
+static void full_dbg_report_topk(uint32_t layer, uint32_t step,
+                                 const full_layer_dbg_scratch *gpu,
+                                 const full_layer_dbg_scratch *cpu) {
+    uint32_t i;
+    fprintf(stderr, "=== DBG_FULL[%u] step=%u TOPK cpu=", layer, step);
+    for (i = 0; i < 8; ++i) {
+        fprintf(stderr, "%s%u:%.6f", i ? "," : "", cpu->router_idx[i], (double)cpu->router_scores[i]);
+    }
+    fprintf(stderr, " gpu=");
+    for (i = 0; i < 8; ++i) {
+        fprintf(stderr, "%s%u:%.6f", i ? "," : "", gpu->router_idx[i], (double)gpu->router_scores[i]);
+    }
+    fprintf(stderr, "\n");
+    fflush(stderr);
+}
+
+static void full_dbg_report_signature(uint32_t layer, uint32_t step, const char *label,
+                                      const float *vals, size_t count) {
+    size_t i;
+    const size_t head_n = count < 8 ? count : 8;
+    double sum = 0.0, sum_sq = 0.0;
+    float max_abs = 0.0f;
+    fprintf(stderr, "=== DBG_FULL_SIG[%u] step=%u %s", layer, step, label);
+    for (i = 0; i < count; ++i) {
+        const float v = vals[i];
+        const float av = fabsf(v);
+        sum += (double)v;
+        sum_sq += (double)v * (double)v;
+        if (av > max_abs) max_abs = av;
+    }
+    fprintf(stderr, " mean=%.8f rms=%.8f max_abs=%.8f head=",
+            count ? (sum / (double)count) : 0.0,
+            count ? sqrt(sum_sq / (double)count) : 0.0,
+            max_abs);
+    for (i = 0; i < head_n; ++i) {
+        fprintf(stderr, "%s%.8f", i ? "," : "", (double)vals[i]);
+    }
+    fprintf(stderr, "\n");
+    fflush(stderr);
+}
+
+static void full_dbg_report_stage_compare(uint32_t full_layer,
+                                          uint32_t step,
+                                          const full_layer_dbg_scratch *gpu,
+                                          const full_layer_dbg_scratch *cpu) {
+    full_dbg_report_signature(full_layer, step, "INPUT_ROW", gpu->input_row, FULL_HIDDEN);
+    full_dbg_report_signature(full_layer, step, "PREV_OUT", gpu->prev_out, FULL_HIDDEN);
+    full_dbg_report_signature(full_layer, step, "PREV_K", gpu->prev_k, FULL_NUM_KV_HEADS * FULL_HEAD_DIM);
+    full_dbg_report_signature(full_layer, step, "PREV_V", gpu->prev_v, FULL_NUM_KV_HEADS * FULL_HEAD_DIM);
+    full_dbg_report_diff(full_layer, step, "ATTN_IN", gpu->attn_in, cpu->attn_in, FULL_HIDDEN);
+    full_dbg_report_diff(full_layer, step, "QG", gpu->qg, cpu->qg, FULL_ATTN_GATE_DIM * 2u);
+    full_dbg_report_diff(full_layer, step, "KK", gpu->kk, cpu->kk, FULL_NUM_KV_HEADS * FULL_HEAD_DIM);
+    full_dbg_report_diff(full_layer, step, "VV", gpu->vv, cpu->vv, FULL_NUM_KV_HEADS * FULL_HEAD_DIM);
+    full_dbg_report_diff(full_layer, step, "Q_CUR", gpu->q_cur, cpu->q_cur, FULL_NUM_HEADS * FULL_HEAD_DIM);
+    full_dbg_report_diff(full_layer, step, "K_CUR", gpu->k_cur, cpu->k_cur, FULL_NUM_KV_HEADS * FULL_HEAD_DIM);
+    full_dbg_report_diff(full_layer, step, "V_CUR", gpu->v_cur, cpu->v_cur, FULL_NUM_KV_HEADS * FULL_HEAD_DIM);
+    full_dbg_report_diff(full_layer, step, "ATTN_OUT", gpu->attn_out_flat, cpu->attn_out_flat, FULL_ATTN_GATE_DIM);
+    full_dbg_report_diff(full_layer, step, "PROJ_OUT", gpu->proj_out, cpu->proj_out, FULL_HIDDEN);
+    full_dbg_report_diff(full_layer, step, "RESIDUAL", gpu->residual, cpu->residual, FULL_HIDDEN);
+    full_dbg_report_diff(full_layer, step, "POST_LN", gpu->post_ln, cpu->post_ln, FULL_HIDDEN);
+    full_dbg_report_diff(full_layer, step, "ROUTER", gpu->router_logits, cpu->router_logits, ROUTER_COUNT);
+    full_dbg_report_topk(full_layer, step, gpu, cpu);
+    full_dbg_report_diff(full_layer, step, "SHARED_OUT", gpu->shared_out, cpu->shared_out, FULL_HIDDEN);
+    full_dbg_report_diff(full_layer, step, "ROUTED_OUT", gpu->routed_out, cpu->routed_out, FULL_HIDDEN);
+    full_dbg_report_diff(full_layer, step, "FINAL_OUT", gpu->final_out, cpu->final_out, FULL_HIDDEN);
+}
+
+static int clone_layer_runtime_for_debug(const live_fixture *fx,
+                                         const layer_runtime *src,
+                                         layer_runtime *dst,
+                                         char *err,
+                                         size_t err_cap) {
+    const size_t qkv_dim = (size_t)fx->key_dim * 2u + fx->value_dim;
+    const size_t state_elems = (size_t)fx->num_v_heads * fx->head_k_dim * fx->head_v_dim;
+    uint32_t i;
+    memset(dst, 0, sizeof(*dst));
+    dst->deltanet_state = (float *)malloc(state_elems * sizeof(float));
+    dst->conv_ring[0] = (float *)malloc(qkv_dim * sizeof(float));
+    dst->conv_ring[1] = (float *)malloc(qkv_dim * sizeof(float));
+    dst->conv_ring[2] = (float *)malloc(qkv_dim * sizeof(float));
+    if (!dst->deltanet_state || !dst->conv_ring[0] || !dst->conv_ring[1] || !dst->conv_ring[2]) {
+        snprintf(err, err_cap, "oom debug runtime clone blk.%u", fx->layer);
+        return 0;
+    }
+    memcpy(dst->deltanet_state, src->deltanet_state, state_elems * sizeof(float));
+    for (i = 0; i < 3; ++i) memcpy(dst->conv_ring[i], src->conv_ring[i], qkv_dim * sizeof(float));
+    dst->conv_ring_count = src->conv_ring_count;
+    if (!alloc_layer_step_scratch(fx, &dst->step, err, err_cap)) return 0;
+    return 1;
+}
+
+static int clone_full_layer_state_for_debug(const full_layer_state *src,
+                                            full_layer_state *dst,
+                                            char *err,
+                                            size_t err_cap) {
+    size_t kv_elems;
+    size_t out_elems;
+    memset(dst, 0, sizeof(*dst));
+    dst->seq_len = src->seq_len;
+    dst->seq_cap = src->seq_cap;
+    if (!src->seq_cap) return 1;
+    kv_elems = (size_t)src->seq_cap * FULL_NUM_KV_HEADS * FULL_HEAD_DIM;
+    out_elems = (size_t)src->seq_cap * FULL_HIDDEN;
+    dst->k_all = (float *)malloc(kv_elems * sizeof(float));
+    dst->v_all = (float *)malloc(kv_elems * sizeof(float));
+    dst->output_seq = (float *)malloc(out_elems * sizeof(float));
+    if (!dst->k_all || !dst->v_all || !dst->output_seq) {
+        snprintf(err, err_cap, "oom clone full state");
+        return 0;
+    }
+    memcpy(dst->k_all, src->k_all, kv_elems * sizeof(float));
+    memcpy(dst->v_all, src->v_all, kv_elems * sizeof(float));
+    memcpy(dst->output_seq, src->output_seq, out_elems * sizeof(float));
+    return 1;
+}
+
+static int clone_full_layer_cache_for_debug(const qwen36_gguf_file *gf,
+                                            const qwen36_35a3b_q8_layer *layer,
+                                            full_layer_cache *dst,
+                                            char *err,
+                                            size_t err_cap) {
+    memset(dst, 0, sizeof(*dst));
+    return ensure_full_layer_loaded(gf, layer, dst, err, err_cap);
+}
+
+static void free_layer_runtime_debug(layer_runtime *rt) {
+    if (!rt) return;
+    free(rt->deltanet_state);
+    free(rt->conv_ring[0]);
+    free(rt->conv_ring[1]);
+    free(rt->conv_ring[2]);
+    free_expert_cache(rt->experts);
+    free_layer_step_scratch(&rt->step);
+    memset(rt, 0, sizeof(*rt));
+}
+
 #ifdef QWEN36_UNIFIED_HAVE_GPU
 static int ensure_layer_gpu_step_scratch(const live_fixture *fx, layer_step_scratch *sc, char *err, size_t err_cap) {
     const uint64_t hidden_bytes = (uint64_t)fx->hidden * sizeof(float);
@@ -1192,6 +1881,17 @@ static int run_step_layer_dynamic(const live_fixture *fx,
     uint32_t router_idx[ROUTER_COUNT];
     float router_scores[ROUTER_COUNT];
     uint32_t h, d, vd, i;
+    static int dbg_cpu_step = 0;
+    int do_dbg = 0;
+    const int do_hybrid_sig = hybrid_dbg_enabled(fx->layer);
+    if (do_dbg) {
+        fprintf(stderr, "=== CPU_HYBRID[%u] step=%u ENTER ===\n", fx->layer, dbg_cpu_step);
+        fflush(stderr);
+        fprintf(stderr, "CPU_HYBRID[%u] step=%u layer_input[0..%u]:", fx->layer, dbg_cpu_step, (fx->hidden < 8 ? fx->hidden : 8u) - 1u);
+        for (i = 0; i < (fx->hidden < 8 ? fx->hidden : 8u); ++i) fprintf(stderr, " %.8f", (double)layer_input[i]);
+        fprintf(stderr, "\n");
+        fflush(stderr);
+    }
 
     {
         double var = 0.0;
@@ -1199,11 +1899,44 @@ static int run_step_layer_dynamic(const live_fixture *fx,
         var /= (double)fx->hidden;
         for (d = 0; d < fx->hidden; ++d) input_ln[d] = (float)(layer_input[d] / sqrt(var + 1e-6)) * fx->attn_norm_w[d];
     }
+    if (do_dbg) {
+        fprintf(stderr, "CPU_HYBRID[%u] step=%u input_ln[0..%u]:", fx->layer, dbg_cpu_step, (fx->hidden < 8 ? fx->hidden : 8u) - 1u);
+        for (i = 0; i < (fx->hidden < 8 ? fx->hidden : 8u); ++i) fprintf(stderr, " %.8f", (double)input_ln[i]);
+        fprintf(stderr, "\n");
+        fflush(stderr);
+    }
     matvec(fx->w_qkv, input_ln, qkv, qkv_dim, fx->hidden);
     matvec(fx->w_z, input_ln, z, fx->value_dim, fx->hidden);
     matvec(fx->w_a, input_ln, a, fx->num_v_heads, fx->hidden);
     matvec(fx->w_b, input_ln, b, fx->num_v_heads, fx->hidden);
+    if (do_dbg) {
+        uint32_t kd = (fx->key_dim < 8 ? fx->key_dim : 8u);
+        uint32_t vd2 = (fx->value_dim < 8 ? fx->value_dim : 8u);
+        uint32_t nvh = (fx->num_v_heads < 8 ? fx->num_v_heads : 8u);
+        fprintf(stderr, "CPU_HYBRID[%u] step=%u qkv_q[0..%u]:", fx->layer, dbg_cpu_step, kd - 1u);
+        for (i = 0; i < kd; ++i) fprintf(stderr, " %.8f", (double)qkv[i]);
+        fprintf(stderr, "\n");
+        fprintf(stderr, "CPU_HYBRID[%u] step=%u qkv_k[0..%u]:", fx->layer, dbg_cpu_step, kd - 1u);
+        for (i = 0; i < kd; ++i) fprintf(stderr, " %.8f", (double)qkv[i + fx->key_dim]);
+        fprintf(stderr, "\n");
+        fprintf(stderr, "CPU_HYBRID[%u] step=%u qkv_v[0..%u]:", fx->layer, dbg_cpu_step, vd2 - 1u);
+        for (i = 0; i < vd2; ++i) fprintf(stderr, " %.8f", (double)qkv[i + fx->key_dim * 2u]);
+        fprintf(stderr, "\n");
+        fprintf(stderr, "CPU_HYBRID[%u] step=%u z[0..%u]:", fx->layer, dbg_cpu_step, vd2 - 1u);
+        for (i = 0; i < vd2; ++i) fprintf(stderr, " %.8f", (double)z[i]);
+        fprintf(stderr, "\n");
+        fprintf(stderr, "CPU_HYBRID[%u] step=%u a[0..%u]:", fx->layer, dbg_cpu_step, nvh - 1u);
+        for (i = 0; i < nvh; ++i) fprintf(stderr, " %.8f", (double)a[i]);
+        fprintf(stderr, "\n");
+        fprintf(stderr, "CPU_HYBRID[%u] step=%u b[0..%u]:", fx->layer, dbg_cpu_step, nvh - 1u);
+        for (i = 0; i < nvh; ++i) fprintf(stderr, " %.8f", (double)b[i]);
+        fprintf(stderr, "\n");
+        fflush(stderr);
+    }
 
+    if (do_hybrid_sig) {
+        hybrid_dbg_report_ring(fx->layer, (uint32_t)g_dbg_decode_step, "PRE", fx, ls, qkv);
+    }
     for (d = 0; d < qkv_dim; ++d) {
         double sum = 0.0;
         if (ls->conv_ring_count >= 3) sum += (double)fx->conv_w[(size_t)d * 4u + 0u] * ls->conv_ring[2][d];
@@ -1264,6 +1997,17 @@ static int run_step_layer_dynamic(const live_fixture *fx,
         }
     }
     matvec(fx->w_out, out_in, out_proj, fx->hidden, fx->value_dim);
+    if (do_dbg) {
+        uint32_t vd2 = (fx->value_dim < 8 ? fx->value_dim : 8u);
+        uint32_t h2 = (fx->hidden < 8 ? fx->hidden : 8u);
+        fprintf(stderr, "CPU_HYBRID[%u] step=%u out_in[0..%u]:", fx->layer, dbg_cpu_step, vd2 - 1u);
+        for (i = 0; i < vd2; ++i) fprintf(stderr, " %.8f", (double)out_in[i]);
+        fprintf(stderr, "\n");
+        fprintf(stderr, "CPU_HYBRID[%u] step=%u out_proj[0..%u]:", fx->layer, dbg_cpu_step, h2 - 1u);
+        for (i = 0; i < h2; ++i) fprintf(stderr, " %.8f", (double)out_proj[i]);
+        fprintf(stderr, "\n");
+        fflush(stderr);
+    }
 
     {
         double var = 0.0;
@@ -1295,10 +2039,22 @@ static int run_step_layer_dynamic(const live_fixture *fx,
         }
     }
 
+    if (do_dbg) {
+        uint32_t h2 = (fx->hidden < 8 ? fx->hidden : 8u);
+        fprintf(stderr, "CPU_HYBRID[%u] step=%u out_row[0..%u]:", fx->layer, dbg_cpu_step, h2 - 1u);
+        for (i = 0; i < h2; ++i) fprintf(stderr, " %.8f", (double)out_row[i]);
+        fprintf(stderr, "\n");
+        fprintf(stderr, "=== CPU_HYBRID[%u] step=%u EXIT ===\n", fx->layer, dbg_cpu_step);
+        fflush(stderr);
+        dbg_cpu_step++;
+    }
     if (ls->conv_ring_count >= 2) memcpy(ls->conv_ring[2], ls->conv_ring[1], (size_t)qkv_dim * sizeof(float));
     if (ls->conv_ring_count >= 1) memcpy(ls->conv_ring[1], ls->conv_ring[0], (size_t)qkv_dim * sizeof(float));
     memcpy(ls->conv_ring[0], qkv, (size_t)qkv_dim * sizeof(float));
     if (ls->conv_ring_count < 3) ls->conv_ring_count++;
+    if (do_hybrid_sig) {
+        hybrid_dbg_report_ring(fx->layer, (uint32_t)g_dbg_decode_step, "POST", fx, ls, qkv);
+    }
     return err[0] == '\0';
 }
 
@@ -1330,9 +2086,34 @@ static int run_hybrid_layer_step_gpuproj(const live_fixture *fx,
     uint32_t router_idx[ROUTER_COUNT];
     float router_scores[ROUTER_COUNT];
     uint32_t h, d, vd, i;
+    static int dbg_gpu_step = 0;
+    int dbg_step_id = dbg_gpu_step;
+    int do_dbg_gpu = 0;
+    int do_cmp_gpu = hybrid_dbg_enabled(fx->layer);
+    layer_runtime cpu_ref_ls;
+    float *cpu_out_row = NULL;
+    if (do_dbg_gpu) {
+        fprintf(stderr, "=== GPU_HYBRID[%u] step=%u ENTER ===\n", fx->layer, dbg_step_id);
+        fflush(stderr);
+        fprintf(stderr, "GPU_HYBRID[%u] step=%u layer_input[0..%u]:", fx->layer, dbg_step_id, (fx->hidden < 8 ? fx->hidden : 8u) - 1u);
+        for (i = 0; i < (fx->hidden < 8 ? fx->hidden : 8u); ++i) fprintf(stderr, " %.8f", (double)layer_input[i]);
+        fprintf(stderr, "\n");
+        fflush(stderr);
+    }
     int ok = 0;
+    memset(&cpu_ref_ls, 0, sizeof(cpu_ref_ls));
 
     memset(core, 0, (size_t)fx->num_v_heads * fx->head_v_dim * sizeof(float));
+    if (do_cmp_gpu) {
+        if (!clone_layer_runtime_for_debug(fx, ls, &cpu_ref_ls, err, err_cap)) {
+            goto cleanup;
+        }
+        cpu_out_row = (float *)malloc((size_t)fx->hidden * sizeof(float));
+        if (!cpu_out_row) {
+            snprintf(err, err_cap, "oom debug cpu out blk.%u", fx->layer);
+            goto cleanup;
+        }
+    }
     if (!ensure_layer_gpu_step_scratch(fx, sc, err, err_cap)) {
         goto cleanup;
     }
@@ -1375,43 +2156,67 @@ static int run_hybrid_layer_step_gpuproj(const live_fixture *fx,
         snprintf(err, err_cap, "gpu b matmul failed blk.%u", fx->layer);
         goto cleanup;
     }
-    {
-        const uint64_t row_bytes = (uint64_t)(fx->hidden / 32u) * 34u;
-        const uint64_t q_off = layer->attn_qkv->abs_offset;
-        const uint64_t k_off = q_off + (uint64_t)fx->key_dim * row_bytes;
-        const uint64_t v_off = k_off + (uint64_t)fx->key_dim * row_bytes;
-        if (ds4_gpu_matmul_q8_0_tensor(q_gpu, mf->map, mf->size, q_off, fx->hidden, fx->key_dim, input_ln_gpu, 1u) == 0) {
-            snprintf(err, err_cap, "gpu q matmul failed blk.%u", fx->layer);
-            goto cleanup;
-        }
-        if (ds4_gpu_matmul_q8_0_tensor(k_gpu, mf->map, mf->size, k_off, fx->hidden, fx->key_dim, input_ln_gpu, 1u) == 0) {
-            snprintf(err, err_cap, "gpu k matmul failed blk.%u", fx->layer);
-            goto cleanup;
-        }
-        if (ds4_gpu_matmul_q8_0_tensor(v_gpu, mf->map, mf->size, v_off, fx->hidden, fx->value_dim, input_ln_gpu, 1u) == 0) {
-            snprintf(err, err_cap, "gpu v matmul failed blk.%u", fx->layer);
-            goto cleanup;
-        }
-    }
     if (ds4_gpu_end_commands() == 0) {
         snprintf(err, err_cap, "gpu end failed blk.%u", fx->layer);
         goto cleanup;
     }
+    if (do_dbg_gpu) {
+        if (ds4_gpu_tensor_read(input_ln_gpu, 0, sc->input_ln, hidden_bytes) == 0) {
+            fprintf(stderr, "GPU_HYBRID[%u] step=%u readback input_ln failed\n", fx->layer, dbg_step_id);
+        } else {
+            float *iln = sc->input_ln;
+            fprintf(stderr, "GPU_HYBRID[%u] step=%u input_ln[0..%u]:", fx->layer, dbg_step_id, (fx->hidden < 8 ? fx->hidden : 8u) - 1u);
+            for (i = 0; i < (fx->hidden < 8 ? fx->hidden : 8u); ++i) fprintf(stderr, " %.8f", (double)iln[i]);
+            fprintf(stderr, "\n");
+        }
+        fflush(stderr);
+    }
     if (ds4_gpu_tensor_read(z_gpu, 0, z_raw, z_bytes) == 0 ||
         ds4_gpu_tensor_read(a_gpu, 0, a_raw, ab_bytes) == 0 ||
-        ds4_gpu_tensor_read(b_gpu, 0, b_raw, ab_bytes) == 0 ||
-        ds4_gpu_tensor_read(q_gpu, 0, qkv_raw, (uint64_t)fx->key_dim * sizeof(float)) == 0 ||
-        ds4_gpu_tensor_read(k_gpu, 0, qkv_raw + fx->key_dim, (uint64_t)fx->key_dim * sizeof(float)) == 0 ||
-        ds4_gpu_tensor_read(v_gpu, 0, qkv_raw + fx->key_dim * 2u, (uint64_t)fx->value_dim * sizeof(float)) == 0) {
-        snprintf(err, err_cap, "gpu qkv+zab readback failed blk.%u", fx->layer);
+        ds4_gpu_tensor_read(b_gpu, 0, b_raw, ab_bytes) == 0) {
+        snprintf(err, err_cap, "gpu zab readback failed blk.%u", fx->layer);
+        goto cleanup;
+    }
+
+    if (!run_gpu_q8_qkv_split_rowwise(mf, layer, fx->hidden, fx->key_dim, fx->value_dim, input_ln_gpu, 1u, qkv_raw)) {
+        snprintf(err, err_cap, "gpu qkv split failed blk.%u", fx->layer);
         goto cleanup;
     }
 
     reorder_head_rows_seq_f32(z, z_raw, 1u, fx->num_v_heads, fx->head_v_dim);
     reorder_head_scalars_seq_f32(a, a_raw, 1u, fx->num_v_heads);
     reorder_head_scalars_seq_f32(b, b_raw, 1u, fx->num_v_heads);
-    reorder_qkv_v_tokenmajor_gg_to_hf(qkv, qkv_raw, 1u, fx->key_dim, fx->num_v_heads, fx->head_v_dim);
+    reorder_qkv_v_tokenmajor_gg_to_hf(qkv, qkv_raw, 1u,
+                                      fx->key_dim,
+                                      fx->num_v_heads, fx->head_v_dim);
+    if (do_dbg_gpu) {
+        uint32_t kd = (fx->key_dim < 8 ? fx->key_dim : 8u);
+        uint32_t vd2 = (fx->value_dim < 8 ? fx->value_dim : 8u);
+        uint32_t nvh = (fx->num_v_heads < 8 ? fx->num_v_heads : 8u);
+        fprintf(stderr, "GPU_HYBRID[%u] step=%u qkv_q[0..%u]:", fx->layer, dbg_step_id, kd - 1u);
+        for (i = 0; i < kd; ++i) fprintf(stderr, " %.8f", (double)qkv[i]);
+        fprintf(stderr, "\n");
+        fprintf(stderr, "GPU_HYBRID[%u] step=%u qkv_k[0..%u]:", fx->layer, dbg_step_id, kd - 1u);
+        for (i = 0; i < kd; ++i) fprintf(stderr, " %.8f", (double)qkv[i + fx->key_dim]);
+        fprintf(stderr, "\n");
+        fprintf(stderr, "GPU_HYBRID[%u] step=%u qkv_v[0..%u]:", fx->layer, dbg_step_id, vd2 - 1u);
+        for (i = 0; i < vd2; ++i) fprintf(stderr, " %.8f", (double)qkv[i + fx->key_dim * 2u]);
+        fprintf(stderr, "\n");
+        fprintf(stderr, "GPU_HYBRID[%u] step=%u z[0..%u]:", fx->layer, dbg_step_id, vd2 - 1u);
+        for (i = 0; i < vd2; ++i) fprintf(stderr, " %.8f", (double)z[i]);
+        fprintf(stderr, "\n");
+        fprintf(stderr, "GPU_HYBRID[%u] step=%u a[0..%u]:", fx->layer, dbg_step_id, nvh - 1u);
+        for (i = 0; i < nvh; ++i) fprintf(stderr, " %.8f", (double)a[i]);
+        fprintf(stderr, "\n");
+        fprintf(stderr, "GPU_HYBRID[%u] step=%u b[0..%u]:", fx->layer, dbg_step_id, nvh - 1u);
+        for (i = 0; i < nvh; ++i) fprintf(stderr, " %.8f", (double)b[i]);
+        fprintf(stderr, "\n");
+        fflush(stderr);
+    }
 
+    if (do_cmp_gpu) {
+        hybrid_dbg_report_ring(fx->layer, (uint32_t)g_dbg_decode_step, "PRE", fx, ls, qkv);
+    }
     for (d = 0; d < qkv_dim; ++d) {
         double sum = 0.0;
         if (ls->conv_ring_count >= 3) sum += (double)fx->conv_w[(size_t)d * 4u + 0u] * ls->conv_ring[2][d];
@@ -1472,6 +2277,13 @@ static int run_hybrid_layer_step_gpuproj(const live_fixture *fx,
             out_in[base + vd] = (float)(cv / sqrt(var + 1e-6)) * fx->ssm_norm_w[vd] * siluf_local(z[(size_t)h * fx->head_v_dim + vd]);
         }
     }
+    if (do_dbg_gpu) {
+        uint32_t vd2 = (fx->value_dim < 8 ? fx->value_dim : 8u);
+        fprintf(stderr, "GPU_HYBRID[%u] step=%u out_in[0..%u]:", fx->layer, dbg_step_id, vd2 - 1u);
+        for (i = 0; i < vd2; ++i) fprintf(stderr, " %.8f", (double)out_in[i]);
+        fprintf(stderr, "\n");
+        fflush(stderr);
+    }
     reorder_out_in_hf_to_gg(out_in_gg, out_in, 1u, fx->num_v_heads, fx->head_v_dim);
     if (ds4_gpu_tensor_write(out_in_gpu, 0, out_in_gg, out_in_bytes) == 0) {
         snprintf(err, err_cap, "gpu out_in write failed blk.%u", fx->layer);
@@ -1493,6 +2305,13 @@ static int run_hybrid_layer_step_gpuproj(const live_fixture *fx,
     if (ds4_gpu_tensor_read(out_proj_gpu, 0, out_proj, hidden_bytes) == 0) {
         snprintf(err, err_cap, "gpu out_proj readback failed blk.%u", fx->layer);
         goto cleanup;
+    }
+    if (do_dbg_gpu) {
+        uint32_t h2 = (fx->hidden < 8 ? fx->hidden : 8u);
+        fprintf(stderr, "GPU_HYBRID[%u] step=%u out_proj[0..%u]:", fx->layer, dbg_step_id, h2 - 1u);
+        for (i = 0; i < h2; ++i) fprintf(stderr, " %.8f", (double)out_proj[i]);
+        fprintf(stderr, "\n");
+        fflush(stderr);
     }
 
     {
@@ -1590,13 +2409,57 @@ static int run_hybrid_layer_step_gpuproj(const live_fixture *fx,
         }
     }
 
+    if (do_cmp_gpu) {
+        char dbg_err[256] = {0};
+        if (ds4_gpu_tensor_read(input_ln_gpu, 0, sc->input_ln, hidden_bytes) == 0) {
+            fprintf(stderr, "=== DBG_HYBRID[%u] step=%d GPU_INPUT_LN readback failed\n", fx->layer, dbg_step_id);
+            fflush(stderr);
+        }
+        if (!run_step_layer_dynamic(fx, gf, layer, &cpu_ref_ls, layer_input, cpu_out_row, dbg_err, sizeof(dbg_err))) {
+            fprintf(stderr, "=== DBG_HYBRID[%u] step=%d CPU_REF failed: %s\n", fx->layer, dbg_step_id, dbg_err);
+            fflush(stderr);
+        } else {
+            hybrid_dbg_report_diff(fx->layer, dbg_step_id, "INPUT_LN", sc->input_ln, cpu_ref_ls.step.input_ln, fx->hidden);
+            hybrid_dbg_report_diff(fx->layer, dbg_step_id, "QKV_RAW", qkv_raw, cpu_ref_ls.step.qkv, qkv_dim);
+            hybrid_dbg_report_diff(fx->layer, dbg_step_id, "Z_RAW", z_raw, cpu_ref_ls.step.z, fx->value_dim);
+            hybrid_dbg_report_diff(fx->layer, dbg_step_id, "A_RAW", a_raw, cpu_ref_ls.step.a, fx->num_v_heads);
+            hybrid_dbg_report_diff(fx->layer, dbg_step_id, "B_RAW", b_raw, cpu_ref_ls.step.b, fx->num_v_heads);
+            hybrid_dbg_report_diff(fx->layer, dbg_step_id, "QKV", qkv, cpu_ref_ls.step.qkv, qkv_dim);
+            hybrid_dbg_report_diff(fx->layer, dbg_step_id, "Z", z, cpu_ref_ls.step.z, fx->value_dim);
+            hybrid_dbg_report_diff(fx->layer, dbg_step_id, "A", a, cpu_ref_ls.step.a, fx->num_v_heads);
+            hybrid_dbg_report_diff(fx->layer, dbg_step_id, "B", b, cpu_ref_ls.step.b, fx->num_v_heads);
+            hybrid_dbg_report_diff(fx->layer, dbg_step_id, "Q", q, cpu_ref_ls.step.q, (size_t)fx->num_v_heads * fx->head_k_dim);
+            hybrid_dbg_report_diff(fx->layer, dbg_step_id, "K", k, cpu_ref_ls.step.k, (size_t)fx->num_v_heads * fx->head_k_dim);
+            hybrid_dbg_report_diff(fx->layer, dbg_step_id, "V", v, cpu_ref_ls.step.v, fx->value_dim);
+            hybrid_dbg_report_diff(fx->layer, dbg_step_id, "BETA", beta, cpu_ref_ls.step.beta, fx->num_v_heads);
+            hybrid_dbg_report_diff(fx->layer, dbg_step_id, "G", g, cpu_ref_ls.step.g, fx->num_v_heads);
+            hybrid_dbg_report_diff(fx->layer, dbg_step_id, "OUT_IN", out_in, cpu_ref_ls.step.out_in, fx->value_dim);
+            hybrid_dbg_report_diff(fx->layer, dbg_step_id, "OUT_PROJ", out_proj, cpu_ref_ls.step.out_proj, fx->hidden);
+            hybrid_dbg_report_diff(fx->layer, dbg_step_id, "FINAL_OUT", out_row, cpu_out_row, fx->hidden);
+        }
+    }
+
     if (ls->conv_ring_count >= 2) memcpy(ls->conv_ring[2], ls->conv_ring[1], (size_t)qkv_dim * sizeof(float));
     if (ls->conv_ring_count >= 1) memcpy(ls->conv_ring[1], ls->conv_ring[0], (size_t)qkv_dim * sizeof(float));
     memcpy(ls->conv_ring[0], qkv, (size_t)qkv_dim * sizeof(float));
     if (ls->conv_ring_count < 3) ls->conv_ring_count++;
+    if (do_cmp_gpu) {
+        hybrid_dbg_report_ring(fx->layer, (uint32_t)g_dbg_decode_step, "POST", fx, ls, qkv);
+    }
+    if (do_dbg_gpu) {
+        uint32_t h2 = (fx->hidden < 8 ? fx->hidden : 8u);
+        fprintf(stderr, "GPU_HYBRID[%u] step=%u out_row[0..%u]:", fx->layer, dbg_step_id, h2 - 1u);
+        for (i = 0; i < h2; ++i) fprintf(stderr, " %.8f", (double)out_row[i]);
+        fprintf(stderr, "\n");
+        fprintf(stderr, "=== GPU_HYBRID[%u] step=%u EXIT ===\n", fx->layer, dbg_step_id);
+        fflush(stderr);
+    }
+    if (do_dbg_gpu || do_cmp_gpu) dbg_gpu_step++;
     ok = 1;
 
 cleanup:
+    free(cpu_out_row);
+    free_layer_runtime_debug(&cpu_ref_ls);
     return ok;
 }
 #endif
@@ -1605,9 +2468,20 @@ static void session_clear_decode_state(unified_session_state *st) {
     uint32_t li, i;
     free(st->token_ids);
     free(st->owned_seq);
+    if (st->cycle_pre_full_seqs) {
+        for (li = 0; li < st->cfg.n_cycles; ++li) free(st->cycle_pre_full_seqs[li]);
+    }
+    if (st->cycle_owned_seqs) {
+        for (li = 0; li < st->cfg.n_cycles; ++li) free(st->cycle_owned_seqs[li]);
+    }
+    free(st->cycle_pre_full_seqs);
+    free(st->cycle_owned_seqs);
     st->token_ids = NULL;
     st->owned_seq = NULL;
+    st->cycle_pre_full_seqs = NULL;
+    st->cycle_owned_seqs = NULL;
     st->seq_len = 0;
+    st->prefill_base_seq_len = 0;
     st->owned_cap = 0;
     st->prefilled = 0;
     for (li = 0; li < st->n_fx; ++li) {
@@ -1803,9 +2677,15 @@ static int session_prefill(unified_session_state *st,
                            size_t err_cap) {
     float *state_seq = NULL;
     float *next_seq = NULL;
+    float *full_dbg_cpu_out = NULL;
     size_t seq_hidden = (size_t)seq_len * hidden;
     uint32_t ci, li, t;
     double t0;
+    full_layer_cache dbg_full_stage_cache;
+    full_layer_state dbg_full_stage_state;
+    full_layer_dbg_scratch dbg_full_cpu;
+    memset(&dbg_full_stage_cache, 0, sizeof(dbg_full_stage_cache));
+    memset(&dbg_full_stage_state, 0, sizeof(dbg_full_stage_state));
     if (st->n_fx == 0) {
         snprintf(err, err_cap, "no hybrid fixtures loaded");
         return 0;
@@ -1869,6 +2749,19 @@ static int session_prefill(unified_session_state *st,
             state_seq = next_seq;
             next_seq = NULL;
         }
+        if (!st->cycle_pre_full_seqs) {
+            st->cycle_pre_full_seqs = (float **)calloc(st->cfg.n_cycles, sizeof(float *));
+            if (!st->cycle_pre_full_seqs) {
+                snprintf(err, err_cap, "oom cycle pre-full snapshot table");
+                goto fail;
+            }
+        }
+        st->cycle_pre_full_seqs[ci] = (float *)malloc(seq_hidden * sizeof(float));
+        if (!st->cycle_pre_full_seqs[ci]) {
+            snprintf(err, err_cap, "oom cycle pre-full snapshot %u", ci);
+            goto fail;
+        }
+        memcpy(st->cycle_pre_full_seqs[ci], state_seq, seq_hidden * sizeof(float));
         if (st->enable_full_prefill_cpu) {
             const uint32_t full_layer = st->cfg.cycles[ci].full_layer;
             double full_t0 = now_ms();
@@ -1893,28 +2786,75 @@ static int session_prefill(unified_session_state *st,
         else if (st->enable_full_prefill_gpu) {
             const uint32_t full_layer = st->cfg.cycles[ci].full_layer;
             double full_t0 = now_ms();
+            const int full_prefill_dbg = full_prefill_dbg_enabled(full_layer);
             fprintf(stderr, "qwen36_unified prefill full layer=%u rows=%u start[gpu]\n", full_layer, seq_len);
             fflush(stderr);
-            if (!run_full_layer_prefill_gpu(full_layer, &st->model.layers[full_layer], &st->mf, &st->full_small_caches[ci], &st->full_states[ci], state_seq, seq_len)) {
-                snprintf(err, err_cap, "gpu full prefill failed layer %u", full_layer);
-                goto fail;
+            if (full_prefill_dbg) {
+                float row_out[FULL_HIDDEN];
+                free_full_layer_state(&st->full_states[ci]);
+                memset(&st->full_states[ci], 0, sizeof(st->full_states[ci]));
+                full_dbg_cpu_out = (float *)malloc((size_t)st->hidden * sizeof(float));
+                if (!full_dbg_cpu_out) {
+                    snprintf(err, err_cap, "oom full prefill debug row");
+                    goto fail;
+                }
+                next_seq = (float *)malloc(seq_hidden * sizeof(float));
+                if (!next_seq) {
+                    snprintf(err, err_cap, "oom full prefill debug seq");
+                    goto fail;
+                }
+                for (t = 0; t < seq_len; ++t) {
+                    const float *full_input_row = state_seq + (size_t)t * hidden;
+                    g_dbg_decode_step = (int)t;
+                    g_full_dbg_active = full_dbg_enabled(full_layer);
+                    if (g_full_dbg_active) {
+                        free_full_layer_state(&dbg_full_stage_state);
+                        free_full_layer_cache(&dbg_full_stage_cache);
+                        memset(&dbg_full_stage_state, 0, sizeof(dbg_full_stage_state));
+                        memset(&dbg_full_stage_cache, 0, sizeof(dbg_full_stage_cache));
+                        if (!clone_full_layer_state_for_debug(&st->full_states[ci], &dbg_full_stage_state, err, err_cap) ||
+                            !clone_full_layer_cache_for_debug(&st->gf, &st->model.layers[full_layer], &dbg_full_stage_cache, err, err_cap)) goto fail;
+                    }
+                    if (!run_full_layer_step_gpu(&st->model.layers[full_layer], &st->mf, &st->full_small_caches[ci], &st->full_states[ci], full_input_row, row_out)) {
+                        snprintf(err, err_cap, "gpu full prefill debug failed layer %u row %u", full_layer, t);
+                        goto fail;
+                    }
+                    memcpy(next_seq + (size_t)t * hidden, row_out, (size_t)hidden * sizeof(float));
+                    if (g_full_dbg_active) {
+                        if (!run_full_layer_step_cpu_debug(&st->model.layers[full_layer], &dbg_full_stage_cache, &dbg_full_stage_state, &st->gf, full_input_row, full_dbg_cpu_out, &dbg_full_cpu, err, err_cap)) goto fail;
+                        full_dbg_report_stage_compare(full_layer, t, &g_full_dbg_gpu, &dbg_full_cpu);
+                        free_full_layer_cache(&dbg_full_stage_cache);
+                        free_full_layer_state(&dbg_full_stage_state);
+                        memset(&dbg_full_stage_cache, 0, sizeof(dbg_full_stage_cache));
+                        memset(&dbg_full_stage_state, 0, sizeof(dbg_full_stage_state));
+                    }
+                    g_full_dbg_active = 0;
+                }
+                g_dbg_decode_step = -1;
+            } else {
+                if (!run_full_layer_prefill_gpu(full_layer, &st->model.layers[full_layer], &st->mf, &st->full_small_caches[ci], &st->full_states[ci], state_seq, seq_len)) {
+                    snprintf(err, err_cap, "gpu full prefill failed layer %u", full_layer);
+                    goto fail;
+                }
             }
             fprintf(stderr,
                     "qwen36_unified prefill full layer=%u returned[gpu] state_output_seq=%p state_seq_len=%u\n",
                     full_layer, (void *)st->full_states[ci].output_seq, st->full_states[ci].seq_len);
             fflush(stderr);
-            next_seq = (float *)malloc(seq_hidden * sizeof(float));
             if (!next_seq) {
-                snprintf(err, err_cap, "oom full prefill gpu copy");
-                goto fail;
+                next_seq = (float *)malloc(seq_hidden * sizeof(float));
+                if (!next_seq) {
+                    snprintf(err, err_cap, "oom full prefill gpu copy");
+                    goto fail;
+                }
+                fprintf(stderr,
+                        "qwen36_unified prefill full layer=%u copying[gpu] bytes=%zu from=%p to=%p\n",
+                        full_layer, seq_hidden * sizeof(float), (void *)st->full_states[ci].output_seq, (void *)next_seq);
+                fflush(stderr);
+                memcpy(next_seq, st->full_states[ci].output_seq, seq_hidden * sizeof(float));
+                fprintf(stderr, "qwen36_unified prefill full layer=%u copied[gpu]\n", full_layer);
+                fflush(stderr);
             }
-            fprintf(stderr,
-                    "qwen36_unified prefill full layer=%u copying[gpu] bytes=%zu from=%p to=%p\n",
-                    full_layer, seq_hidden * sizeof(float), (void *)st->full_states[ci].output_seq, (void *)next_seq);
-            fflush(stderr);
-            memcpy(next_seq, st->full_states[ci].output_seq, seq_hidden * sizeof(float));
-            fprintf(stderr, "qwen36_unified prefill full layer=%u copied[gpu]\n", full_layer);
-            fflush(stderr);
             fprintf(stderr, "qwen36_unified prefill full layer=%u ms=%.2f[gpu]\n", full_layer, now_ms() - full_t0);
             fflush(stderr);
             free(state_seq);
@@ -1923,8 +2863,25 @@ static int session_prefill(unified_session_state *st,
         }
 #endif
     }
+    st->cycle_owned_seqs = (float **)calloc(st->cfg.n_cycles, sizeof(float *));
+    if (!st->cycle_owned_seqs) {
+        snprintf(err, err_cap, "oom cycle snapshot table");
+        goto fail;
+    }
+    {
+        const size_t cycle_bytes = seq_hidden * sizeof(float);
+        for (ci = 0; ci < st->cfg.n_cycles; ++ci) {
+            st->cycle_owned_seqs[ci] = (float *)malloc(cycle_bytes);
+            if (!st->cycle_owned_seqs[ci]) {
+                snprintf(err, err_cap, "oom cycle snapshot %u", ci);
+                goto fail;
+            }
+            memcpy(st->cycle_owned_seqs[ci], st->full_states[ci].output_seq, cycle_bytes);
+        }
+    }
     st->owned_seq = state_seq;
     st->seq_len = seq_len;
+    st->prefill_base_seq_len = seq_len;
     st->owned_cap = seq_len;
     st->prefilled = 1;
     fprintf(stderr, "qwen36_unified prefill fixtures=%u full_prefill_cpu=%d"
@@ -1938,9 +2895,32 @@ static int session_prefill(unified_session_state *st,
 #endif
             st->seq_len, now_ms() - t0);
     fflush(stderr);
+    free_full_layer_cache(&dbg_full_stage_cache);
+    free_full_layer_state(&dbg_full_stage_state);
+    free(full_dbg_cpu_out);
     return 1;
 
 fail:
+    g_full_dbg_active = 0;
+    g_dbg_decode_step = -1;
+    free_full_layer_cache(&dbg_full_stage_cache);
+    free_full_layer_state(&dbg_full_stage_state);
+    free(full_dbg_cpu_out);
+    if (st->cycle_pre_full_seqs) {
+        for (ci = 0; ci < st->cfg.n_cycles; ++ci) free(st->cycle_pre_full_seqs[ci]);
+        free(st->cycle_pre_full_seqs);
+        st->cycle_pre_full_seqs = NULL;
+    }
+    if (st->cycle_owned_seqs) {
+        for (ci = 0; ci < st->cfg.n_cycles; ++ci) free(st->cycle_owned_seqs[ci]);
+        free(st->cycle_owned_seqs);
+        st->cycle_owned_seqs = NULL;
+    }
+    st->owned_seq = NULL;
+    st->seq_len = 0;
+    st->prefill_base_seq_len = 0;
+    st->owned_cap = 0;
+    st->prefilled = 0;
     free(state_seq);
     free(next_seq);
     return 0;
@@ -1951,23 +2931,68 @@ static int session_step(unified_session_state *st, uint32_t token_id, char *err,
     float *next_row = NULL;
     float *row_a = NULL;
     float *row_b = NULL;
+    float *cpu_state_row = NULL;
+    float *cpu_next_row = NULL;
+    float *cpu_row_a = NULL;
+    float *cpu_row_b = NULL;
+    float *full_dbg_cpu_out = NULL;
     uint32_t ci, li;
     double t0;
     const int verbose = st->verbose_logs;
+    int dbg_boundary = 0;
+    layer_runtime dbg_layers[4];
+    full_layer_state dbg_full0;
+    full_layer_cache dbg_full_cache0;
+    full_layer_state dbg_full_stage_state;
+    full_layer_cache dbg_full_stage_cache;
+    full_layer_dbg_scratch dbg_full_cpu;
+    int dbg_ready = 0;
+    char boundary_label[32];
     if (!st->prefilled || st->n_fx == 0 || st->fxs[0].layer != 0) {
         snprintf(err, err_cap, "hybrid step requires blk0 first fixture");
         return 0;
     }
+    memset(dbg_layers, 0, sizeof(dbg_layers));
+    memset(&dbg_full0, 0, sizeof(dbg_full0));
+    memset(&dbg_full_cache0, 0, sizeof(dbg_full_cache0));
+    memset(&dbg_full_stage_state, 0, sizeof(dbg_full_stage_state));
+    memset(&dbg_full_stage_cache, 0, sizeof(dbg_full_stage_cache));
     row_a = (float *)malloc((size_t)st->hidden * sizeof(float));
     row_b = (float *)malloc((size_t)st->hidden * sizeof(float));
-    if (!row_a || !row_b) {
+    full_dbg_cpu_out = (float *)malloc((size_t)st->hidden * sizeof(float));
+    if (!row_a || !row_b || !full_dbg_cpu_out) {
         snprintf(err, err_cap, "oom step rows");
         return 0;
     }
     state_row = row_a;
     next_row = row_b;
     t0 = now_ms();
+    g_dbg_decode_step = (st->seq_len >= st->prefill_base_seq_len) ? (int)(st->seq_len - st->prefill_base_seq_len) : -1;
+    dbg_boundary = boundary_dbg_enabled() && g_dbg_decode_step >= 0;
+    if (dbg_boundary) {
+        cpu_row_a = (float *)malloc((size_t)st->hidden * sizeof(float));
+        cpu_row_b = (float *)malloc((size_t)st->hidden * sizeof(float));
+        if (!cpu_row_a || !cpu_row_b) {
+            snprintf(err, err_cap, "oom boundary rows");
+            goto fail;
+        }
+        cpu_state_row = cpu_row_a;
+        cpu_next_row = cpu_row_b;
+        if (!clone_layer_runtime_for_debug(&st->fxs[0], &st->layers[0], &dbg_layers[0], err, err_cap) ||
+            !clone_layer_runtime_for_debug(&st->fxs[1], &st->layers[1], &dbg_layers[1], err, err_cap) ||
+            !clone_layer_runtime_for_debug(&st->fxs[2], &st->layers[2], &dbg_layers[2], err, err_cap) ||
+            !clone_layer_runtime_for_debug(&st->fxs[3], &st->layers[3], &dbg_layers[3], err, err_cap) ||
+            !clone_full_layer_state_for_debug(&st->full_states[0], &dbg_full0, err, err_cap) ||
+            !clone_full_layer_cache_for_debug(&st->gf, &st->model.layers[st->cfg.cycles[0].full_layer], &dbg_full_cache0, err, err_cap)) {
+            goto fail;
+        }
+        dbg_ready = 1;
+    }
     if (!decode_q8_row(&st->gf, st->model.token_embd, token_id, st->hidden, state_row, err, err_cap)) goto fail;
+    if (dbg_ready) memcpy(cpu_state_row, state_row, (size_t)st->hidden * sizeof(float));
+    if (dbg_boundary) {
+        boundary_dbg_report_signature((uint32_t)g_dbg_decode_step, "INPUT_EMBD", state_row, st->hidden);
+    }
     if (st->enable_full_prefill_cpu) {
         for (ci = 0; ci < st->cfg.n_cycles; ++ci) {
             uint32_t start = st->cycle_fx_offsets[ci];
@@ -2014,7 +3039,7 @@ static int session_step(unified_session_state *st, uint32_t token_id, char *err,
                             fflush(stderr);
                         }
                         if (!run_hybrid_layer_step_gpuproj(&st->fxs[li], &st->gf, &st->model.layers[st->fxs[li].layer], &st->mf, &st->layers[li], state_row, next_row, err, err_cap)) goto fail;
-                        if (verbose) fprintf(stderr, "qwen36_unified step layer=%u ms=%.2f[gpu-proj]\n", st->fxs[li].layer, now_ms() - layer_t0);
+                if (verbose) fprintf(stderr, "qwen36_unified step layer=%u ms=%.2f[gpu-proj]\n", st->fxs[li].layer, now_ms() - layer_t0);
                     } else {
                         if (verbose) {
                             fprintf(stderr, "qwen36_unified step layer=%u start\n", st->fxs[li].layer);
@@ -2022,6 +3047,29 @@ static int session_step(unified_session_state *st, uint32_t token_id, char *err,
                         }
                         if (!run_step_layer_dynamic(&st->fxs[li], &st->gf, &st->model.layers[st->fxs[li].layer], &st->layers[li], state_row, next_row, err, err_cap)) goto fail;
                         if (verbose) fprintf(stderr, "qwen36_unified step layer=%u ms=%.2f\n", st->fxs[li].layer, now_ms() - layer_t0);
+                        if (dbg_ready && ci == 1 && li == 3) {
+                            fprintf(stderr, "=== DBG_BOUNDARY step=%u ENTER_PREPOST_L4_CPU_REF\n", (uint32_t)g_dbg_decode_step);
+                            fflush(stderr);
+                            boundary_dbg_report_diff((uint32_t)g_dbg_decode_step, "PRE_L4", state_row, cpu_state_row, st->hidden);
+                            if (!run_step_layer_dynamic(&st->fxs[li], &st->gf, &st->model.layers[st->fxs[li].layer], &dbg_layers[3], cpu_state_row, cpu_next_row, err, err_cap)) goto fail;
+                            fprintf(stderr, "=== DBG_BOUNDARY step=%u DONE_PREPOST_L4_CPU_REF\n", (uint32_t)g_dbg_decode_step);
+                            fflush(stderr);
+                            boundary_dbg_report_diff((uint32_t)g_dbg_decode_step, "POST_L4", next_row, cpu_next_row, st->hidden);
+                            { float *tmp = cpu_state_row; cpu_state_row = cpu_next_row; cpu_next_row = tmp; }
+                        }
+                    }
+                    if (dbg_ready && ci == 0 && li <= 2) {
+                        if (!run_step_layer_dynamic(&st->fxs[li], &st->gf, &st->model.layers[st->fxs[li].layer], &dbg_layers[li], cpu_state_row, cpu_next_row, err, err_cap)) goto fail;
+                        { float *tmp = cpu_state_row; cpu_state_row = cpu_next_row; cpu_next_row = tmp; }
+                        if (dbg_boundary) {
+                            snprintf(boundary_label, sizeof(boundary_label), "POST_L%u", st->fxs[li].layer);
+                            boundary_dbg_report_signature((uint32_t)g_dbg_decode_step, boundary_label, next_row, st->hidden);
+                            boundary_dbg_report_layer_runtime((uint32_t)g_dbg_decode_step,
+                                                              st->fxs[li].layer,
+                                                              &st->fxs[li],
+                                                              &st->layers[li]);
+                        }
+                        if (li == 2) boundary_dbg_report_diff((uint32_t)g_dbg_decode_step, "POST_L2", next_row, cpu_state_row, st->hidden);
                     }
                     if (verbose) fflush(stderr);
                     { float *tmp = state_row; state_row = next_row; next_row = tmp; }
@@ -2029,17 +3077,105 @@ static int session_step(unified_session_state *st, uint32_t token_id, char *err,
                 {
                     const uint32_t full_layer = st->cfg.cycles[ci].full_layer;
                     double full_t0 = now_ms();
+                    const float *full_input_row = state_row;
+                    const int full_bc = full_dbg_breadcrumb_enabled();
                     if (verbose) {
                         fprintf(stderr, "qwen36_unified step full layer=%u start[gpu]\n", full_layer);
+                        fflush(stderr);
+                    }
+                    g_full_dbg_active = full_dbg_enabled(full_layer);
+                    if (dbg_boundary && ci == 0) {
+                        snprintf(boundary_label, sizeof(boundary_label), "PRE_FULL%u", full_layer);
+                        boundary_dbg_report_signature((uint32_t)g_dbg_decode_step, boundary_label, state_row, st->hidden);
+                    }
+                    if (full_bc) {
+                        fprintf(stderr, "=== DBG_FULL_BC[%u] step=%u ENTER\n", full_layer, (uint32_t)g_dbg_decode_step);
+                        fflush(stderr);
+                    }
+                    if (g_full_dbg_active) {
+                        if (full_bc) {
+                            fprintf(stderr, "=== DBG_FULL_BC[%u] step=%u CLONE_START\n", full_layer, (uint32_t)g_dbg_decode_step);
+                            fflush(stderr);
+                        }
+                        free_full_layer_state(&dbg_full_stage_state);
+                        free_full_layer_cache(&dbg_full_stage_cache);
+                        memset(&dbg_full_stage_state, 0, sizeof(dbg_full_stage_state));
+                        memset(&dbg_full_stage_cache, 0, sizeof(dbg_full_stage_cache));
+                        if (!clone_full_layer_state_for_debug(&st->full_states[ci], &dbg_full_stage_state, err, err_cap) ||
+                            !clone_full_layer_cache_for_debug(&st->gf, &st->model.layers[full_layer], &dbg_full_stage_cache, err, err_cap)) goto fail;
+                        if (full_bc) {
+                            fprintf(stderr, "=== DBG_FULL_BC[%u] step=%u CLONE_DONE\n", full_layer, (uint32_t)g_dbg_decode_step);
+                            fflush(stderr);
+                        }
+                    }
+                    if (full_bc) {
+                        fprintf(stderr, "=== DBG_FULL_BC[%u] step=%u GPU_STEP_START\n", full_layer, (uint32_t)g_dbg_decode_step);
                         fflush(stderr);
                     }
                     if (!run_full_layer_step_gpu(&st->model.layers[full_layer], &st->mf, &st->full_small_caches[ci], &st->full_states[ci], state_row, next_row)) {
                         snprintf(err, err_cap, "gpu full step failed layer %u", full_layer);
                         goto fail;
                     }
+                    if (full_bc) {
+                        fprintf(stderr, "=== DBG_FULL_BC[%u] step=%u GPU_STEP_DONE\n", full_layer, (uint32_t)g_dbg_decode_step);
+                        fflush(stderr);
+                    }
+                    if (g_full_dbg_active) {
+                        if (full_bc) {
+                            fprintf(stderr, "=== DBG_FULL_BC[%u] step=%u CPU_DEBUG_START\n", full_layer, (uint32_t)g_dbg_decode_step);
+                            fflush(stderr);
+                        }
+                        if (!run_full_layer_step_cpu_debug(&st->model.layers[full_layer], &dbg_full_stage_cache, &dbg_full_stage_state, &st->gf, full_input_row, full_dbg_cpu_out, &dbg_full_cpu, err, err_cap)) goto fail;
+                        if (full_bc) {
+                            fprintf(stderr, "=== DBG_FULL_BC[%u] step=%u CPU_DEBUG_DONE\n", full_layer, (uint32_t)g_dbg_decode_step);
+                            fflush(stderr);
+                        }
+                        full_dbg_report_signature(full_layer, (uint32_t)g_dbg_decode_step, "INPUT_ROW", g_full_dbg_gpu.input_row, FULL_HIDDEN);
+                        full_dbg_report_signature(full_layer, (uint32_t)g_dbg_decode_step, "PREV_OUT", g_full_dbg_gpu.prev_out, FULL_HIDDEN);
+                        full_dbg_report_signature(full_layer, (uint32_t)g_dbg_decode_step, "PREV_K", g_full_dbg_gpu.prev_k, FULL_NUM_KV_HEADS * FULL_HEAD_DIM);
+                        full_dbg_report_signature(full_layer, (uint32_t)g_dbg_decode_step, "PREV_V", g_full_dbg_gpu.prev_v, FULL_NUM_KV_HEADS * FULL_HEAD_DIM);
+                        full_dbg_report_diff(full_layer, (uint32_t)g_dbg_decode_step, "ATTN_IN", g_full_dbg_gpu.attn_in, dbg_full_cpu.attn_in, FULL_HIDDEN);
+                        full_dbg_report_diff(full_layer, (uint32_t)g_dbg_decode_step, "QG", g_full_dbg_gpu.qg, dbg_full_cpu.qg, FULL_ATTN_GATE_DIM * 2u);
+                        full_dbg_report_diff(full_layer, (uint32_t)g_dbg_decode_step, "KK", g_full_dbg_gpu.kk, dbg_full_cpu.kk, FULL_NUM_KV_HEADS * FULL_HEAD_DIM);
+                        full_dbg_report_diff(full_layer, (uint32_t)g_dbg_decode_step, "VV", g_full_dbg_gpu.vv, dbg_full_cpu.vv, FULL_NUM_KV_HEADS * FULL_HEAD_DIM);
+                        full_dbg_report_diff(full_layer, (uint32_t)g_dbg_decode_step, "Q_CUR", g_full_dbg_gpu.q_cur, dbg_full_cpu.q_cur, FULL_NUM_HEADS * FULL_HEAD_DIM);
+                        full_dbg_report_diff(full_layer, (uint32_t)g_dbg_decode_step, "K_CUR", g_full_dbg_gpu.k_cur, dbg_full_cpu.k_cur, FULL_NUM_KV_HEADS * FULL_HEAD_DIM);
+                        full_dbg_report_diff(full_layer, (uint32_t)g_dbg_decode_step, "V_CUR", g_full_dbg_gpu.v_cur, dbg_full_cpu.v_cur, FULL_NUM_KV_HEADS * FULL_HEAD_DIM);
+                        full_dbg_report_diff(full_layer, (uint32_t)g_dbg_decode_step, "ATTN_OUT", g_full_dbg_gpu.attn_out_flat, dbg_full_cpu.attn_out_flat, FULL_ATTN_GATE_DIM);
+                        full_dbg_report_diff(full_layer, (uint32_t)g_dbg_decode_step, "PROJ_OUT", g_full_dbg_gpu.proj_out, dbg_full_cpu.proj_out, FULL_HIDDEN);
+                        full_dbg_report_diff(full_layer, (uint32_t)g_dbg_decode_step, "RESIDUAL", g_full_dbg_gpu.residual, dbg_full_cpu.residual, FULL_HIDDEN);
+                        full_dbg_report_diff(full_layer, (uint32_t)g_dbg_decode_step, "POST_LN", g_full_dbg_gpu.post_ln, dbg_full_cpu.post_ln, FULL_HIDDEN);
+                        full_dbg_report_diff(full_layer, (uint32_t)g_dbg_decode_step, "ROUTER", g_full_dbg_gpu.router_logits, dbg_full_cpu.router_logits, ROUTER_COUNT);
+                        full_dbg_report_topk(full_layer, (uint32_t)g_dbg_decode_step, &g_full_dbg_gpu, &dbg_full_cpu);
+                        full_dbg_report_diff(full_layer, (uint32_t)g_dbg_decode_step, "SHARED_OUT", g_full_dbg_gpu.shared_out, dbg_full_cpu.shared_out, FULL_HIDDEN);
+                        full_dbg_report_diff(full_layer, (uint32_t)g_dbg_decode_step, "ROUTED_OUT", g_full_dbg_gpu.routed_out, dbg_full_cpu.routed_out, FULL_HIDDEN);
+                        full_dbg_report_diff(full_layer, (uint32_t)g_dbg_decode_step, "FINAL_OUT", g_full_dbg_gpu.final_out, dbg_full_cpu.final_out, FULL_HIDDEN);
+                        free_full_layer_cache(&dbg_full_stage_cache);
+                        free_full_layer_state(&dbg_full_stage_state);
+                        memset(&dbg_full_stage_cache, 0, sizeof(dbg_full_stage_cache));
+                        memset(&dbg_full_stage_state, 0, sizeof(dbg_full_stage_state));
+                        if (full_bc) {
+                            fprintf(stderr, "=== DBG_FULL_BC[%u] step=%u REPORT_DONE\n", full_layer, (uint32_t)g_dbg_decode_step);
+                            fflush(stderr);
+                        }
+                    }
+                    g_full_dbg_active = 0;
+                    if (full_bc) {
+                        fprintf(stderr, "=== DBG_FULL_BC[%u] step=%u EXIT\n", full_layer, (uint32_t)g_dbg_decode_step);
+                        fflush(stderr);
+                    }
                     if (verbose) {
                         fprintf(stderr, "qwen36_unified step full layer=%u ms=%.2f[gpu]\n", full_layer, now_ms() - full_t0);
                         fflush(stderr);
+                    }
+                    if (dbg_ready && ci == 0) {
+                        fprintf(stderr, "=== DBG_BOUNDARY step=%u ENTER_POST_FULL3_CPU_REF\n", (uint32_t)g_dbg_decode_step);
+                        fflush(stderr);
+                        if (!run_full_layer_step_cpu(&st->model.layers[full_layer], &dbg_full_cache0, &dbg_full0, &st->gf, cpu_state_row, cpu_next_row, err, err_cap)) goto fail;
+                        fprintf(stderr, "=== DBG_BOUNDARY step=%u DONE_POST_FULL3_CPU_REF\n", (uint32_t)g_dbg_decode_step);
+                        fflush(stderr);
+                        boundary_dbg_report_diff((uint32_t)g_dbg_decode_step, "POST_FULL3", next_row, cpu_next_row, st->hidden);
+                        { float *tmp = cpu_state_row; cpu_state_row = cpu_next_row; cpu_next_row = tmp; }
                     }
                     { float *tmp = state_row; state_row = next_row; next_row = tmp; }
                 }
@@ -2070,11 +3206,37 @@ static int session_step(unified_session_state *st, uint32_t token_id, char *err,
         fprintf(stderr, "qwen36_unified step fixtures=%u seq_len=%u token=%u ms=%.2f\n", st->n_fx, st->seq_len, token_id, now_ms() - t0);
         fflush(stderr);
     }
+    g_dbg_decode_step = -1;
+    g_full_dbg_active = 0;
+    free_full_layer_cache(&dbg_full_cache0);
+    free_full_layer_state(&dbg_full0);
+    free_full_layer_cache(&dbg_full_stage_cache);
+    free_full_layer_state(&dbg_full_stage_state);
+    free_layer_runtime_debug(&dbg_layers[0]);
+    free_layer_runtime_debug(&dbg_layers[1]);
+    free_layer_runtime_debug(&dbg_layers[2]);
+    free_layer_runtime_debug(&dbg_layers[3]);
+    free(full_dbg_cpu_out);
+    free(cpu_row_a);
+    free(cpu_row_b);
     free(row_a);
     free(row_b);
     return 1;
 
 fail:
+    g_dbg_decode_step = -1;
+    g_full_dbg_active = 0;
+    free_full_layer_cache(&dbg_full_cache0);
+    free_full_layer_state(&dbg_full0);
+    free_full_layer_cache(&dbg_full_stage_cache);
+    free_full_layer_state(&dbg_full_stage_state);
+    free_layer_runtime_debug(&dbg_layers[0]);
+    free_layer_runtime_debug(&dbg_layers[1]);
+    free_layer_runtime_debug(&dbg_layers[2]);
+    free_layer_runtime_debug(&dbg_layers[3]);
+    free(full_dbg_cpu_out);
+    free(cpu_row_a);
+    free(cpu_row_b);
     free(row_a);
     free(row_b);
     return 0;
@@ -2144,6 +3306,48 @@ static void handle_dump_last(const unified_session_state *st) {
     printf("LAST %u %zu\n", st->hidden, n_bytes);
     fflush(stdout);
     (void)write_all(STDOUT_FILENO, last, n_bytes);
+}
+
+static void handle_dump_cycle_hidden(const unified_session_state *st, char *rest) {
+    uint32_t cycle_idx = 0;
+    size_t n = 0;
+    size_t n_bytes = 0;
+    if (sscanf(rest ? rest : "", "%u", &cycle_idx) != 1) {
+        printf("ERROR bad DUMP_CYCLE_HIDDEN args\n");
+        fflush(stdout);
+        return;
+    }
+    if (!st->prefilled || !st->cycle_owned_seqs || cycle_idx >= st->cfg.n_cycles || !st->cycle_owned_seqs[cycle_idx]) {
+        printf("ERROR bad cycle hidden\n");
+        fflush(stdout);
+        return;
+    }
+    n = (size_t)st->seq_len * st->hidden;
+    n_bytes = n * sizeof(float);
+    printf("CYCLE_HIDDEN %u %zu %zu\n", cycle_idx, n, n_bytes);
+    fflush(stdout);
+    (void)write_all(STDOUT_FILENO, st->cycle_owned_seqs[cycle_idx], n_bytes);
+}
+
+static void handle_dump_cycle_pre_hidden(const unified_session_state *st, char *rest) {
+    uint32_t cycle_idx = 0;
+    size_t n = 0;
+    size_t n_bytes = 0;
+    if (sscanf(rest ? rest : "", "%u", &cycle_idx) != 1) {
+        printf("ERROR bad DUMP_CYCLE_PRE_HIDDEN args\n");
+        fflush(stdout);
+        return;
+    }
+    if (!st->prefilled || !st->cycle_pre_full_seqs || cycle_idx >= st->cfg.n_cycles || !st->cycle_pre_full_seqs[cycle_idx]) {
+        printf("ERROR bad cycle pre hidden\n");
+        fflush(stdout);
+        return;
+    }
+    n = (size_t)st->seq_len * st->hidden;
+    n_bytes = n * sizeof(float);
+    printf("CYCLE_PRE_HIDDEN %u %zu %zu\n", cycle_idx, n, n_bytes);
+    fflush(stdout);
+    (void)write_all(STDOUT_FILENO, st->cycle_pre_full_seqs[cycle_idx], n_bytes);
 }
 
 static void handle_prefill_prefix_bin(unified_session_state *st, char *rest) {
@@ -2245,6 +3449,10 @@ int main(int argc, char **argv) {
             handle_step(&st, strtok(NULL, ""));
         } else if (strcmp(cmd, "DUMP_HIDDEN") == 0) {
             handle_dump_hidden(&st);
+        } else if (strcmp(cmd, "DUMP_CYCLE_HIDDEN") == 0) {
+            handle_dump_cycle_hidden(&st, strtok(NULL, ""));
+        } else if (strcmp(cmd, "DUMP_CYCLE_PRE_HIDDEN") == 0) {
+            handle_dump_cycle_pre_hidden(&st, strtok(NULL, ""));
         } else if (strcmp(cmd, "DUMP_LAST") == 0) {
             handle_dump_last(&st);
         } else if (strcmp(cmd, "RESET") == 0) {
