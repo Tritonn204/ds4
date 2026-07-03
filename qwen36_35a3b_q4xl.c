@@ -144,38 +144,18 @@ static bool tensor_exists(const qwen36_gguf_file *gf, uint32_t layer, const char
     return qwen36_gguf_find_tensor(gf, name) != NULL;
 }
 
-static uint32_t expect_ffn_gate_up_type(uint32_t layer) {
-    return layer == 1 ? QWEN36_GGUF_TYPE_Q5_K : QWEN36_GGUF_TYPE_Q4_K;
-}
-
-static uint32_t expect_ffn_down_type(uint32_t layer) {
-    switch (layer) {
-    case 1:
-    case 34:
-    case 38:
-    case 39:
-        return QWEN36_GGUF_TYPE_Q6_K;
-    default:
-        return QWEN36_GGUF_TYPE_Q5_K;
-    }
-}
-
-static bool expect_ffn_down_tensor(const qwen36_gguf_file *gf, uint32_t layer,
-                                   const qwen36_gguf_tensor **out, char *err, size_t err_cap) {
-    static const uint32_t allowed[] = {
-        QWEN36_GGUF_TYPE_Q4_K,
-        QWEN36_GGUF_TYPE_Q5_K,
-        QWEN36_GGUF_TYPE_Q6_K,
-    };
-    char name[128];
-    const qwen36_gguf_tensor *t;
-    layer_name(name, sizeof(name), layer, "ffn_down_exps.weight");
-    t = qwen36_gguf_find_tensor(gf, name);
+static bool expect_routed_tensor_shape(const qwen36_gguf_tensor *t,
+                                       const char *name,
+                                       uint32_t d0,
+                                       uint32_t d1,
+                                       uint32_t d2,
+                                       char *err,
+                                       size_t err_cap) {
     if (!t) {
         set_err(err, err_cap, "missing tensor %s", name);
         return false;
     }
-    if (t->ndim != 3 || t->dims[0] != 512 || t->dims[1] != 2048 || t->dims[2] != 256) {
+    if (t->ndim != 3 || t->dims[0] != d0 || t->dims[1] != d1 || t->dims[2] != d2) {
         set_err(err, err_cap,
                 "tensor %s mismatch: got type=%s ndim=%u dims=[%llu,%llu,%llu] expected ndim=%u dims=[%u,%u,%u]",
                 name,
@@ -184,12 +164,51 @@ static bool expect_ffn_down_tensor(const qwen36_gguf_file *gf, uint32_t layer,
                 (unsigned long long)t->dims[0],
                 (unsigned long long)t->dims[1],
                 (unsigned long long)t->dims[2],
-                3u, 512u, 2048u, 256u);
+                3u, d0, d1, d2);
         return false;
     }
+    return true;
+}
+
+static bool expect_ffn_down_tensor(const qwen36_gguf_file *gf, uint32_t layer,
+                                   const qwen36_gguf_tensor **out, char *err, size_t err_cap) {
+    static const uint32_t allowed[] = {
+        QWEN36_GGUF_TYPE_Q2_K,
+        QWEN36_GGUF_TYPE_Q4_K,
+        QWEN36_GGUF_TYPE_Q5_K,
+        QWEN36_GGUF_TYPE_Q6_K,
+    };
+    char name[128];
+    const qwen36_gguf_tensor *t;
+    layer_name(name, sizeof(name), layer, "ffn_down_exps.weight");
+    t = qwen36_gguf_find_tensor(gf, name);
+    if (!expect_routed_tensor_shape(t, name, 512, 2048, 256, err, err_cap)) return false;
     if (!tensor_type_in(t->type, allowed, sizeof(allowed) / sizeof(allowed[0]))) {
         set_err(err, err_cap,
-                "tensor %s mismatch: got type=%s expected one of {q4_k,q5_k,q6_k}",
+                "tensor %s mismatch: got type=%s expected one of {q2_k,q4_k,q5_k,q6_k}",
+                name, qwen36_gguf_type_name(t->type));
+        return false;
+    }
+    *out = t;
+    return true;
+}
+
+static bool expect_ffn_gate_up_tensor(const qwen36_gguf_file *gf, uint32_t layer, const char *suffix,
+                                      const qwen36_gguf_tensor **out, char *err, size_t err_cap) {
+    static const uint32_t allowed[] = {
+        QWEN36_GGUF_TYPE_IQ2_XXS,
+        QWEN36_GGUF_TYPE_Q2_K,
+        QWEN36_GGUF_TYPE_Q4_K,
+        QWEN36_GGUF_TYPE_Q5_K,
+    };
+    char name[128];
+    const qwen36_gguf_tensor *t;
+    layer_name(name, sizeof(name), layer, suffix);
+    t = qwen36_gguf_find_tensor(gf, name);
+    if (!expect_routed_tensor_shape(t, name, 2048, 512, 256, err, err_cap)) return false;
+    if (!tensor_type_in(t->type, allowed, sizeof(allowed) / sizeof(allowed[0]))) {
+        set_err(err, err_cap,
+                "tensor %s mismatch: got type=%s expected one of {iq2_xxs,q2_k,q4_k,q5_k}",
                 name, qwen36_gguf_type_name(t->type));
         return false;
     }
@@ -227,9 +246,11 @@ static bool validate_export_surface(const qwen36_gguf_file *gf, char *err, size_
     for (i = 0; i < gf->tensor_count; i++) {
         uint32_t type = gf->tensors[i].type;
         if (type != QWEN36_GGUF_TYPE_F32 &&
+            type != QWEN36_GGUF_TYPE_Q2_K &&
             type != QWEN36_GGUF_TYPE_Q4_K &&
             type != QWEN36_GGUF_TYPE_Q5_K &&
             type != QWEN36_GGUF_TYPE_Q6_K &&
+            type != QWEN36_GGUF_TYPE_IQ2_XXS &&
             type != QWEN36_GGUF_TYPE_Q8_0) {
             set_err(err, err_cap, "tensor %s has unsupported type %s",
                     gf->tensors[i].name, qwen36_gguf_type_name(type));
@@ -242,14 +263,20 @@ static bool validate_export_surface(const qwen36_gguf_file *gf, char *err, size_
 static bool bind_layer(const qwen36_gguf_file *gf, uint32_t i, qwen36_35a3b_q4xl_layer *l, char *err, size_t err_cap) {
     bool has_hybrid = tensor_exists(gf, i, "attn_qkv.weight");
     bool has_full = tensor_exists(gf, i, "attn_q.weight");
-    uint32_t gate_up_type = expect_ffn_gate_up_type(i);
     memset(l, 0, sizeof(*l));
     if (!expect_layer_tensor(gf, i, "attn_norm.weight", QWEN36_GGUF_TYPE_F32, 1, 2048, 0, 0, &l->attn_norm, err, err_cap)) return false;
     if (!expect_layer_tensor(gf, i, "post_attention_norm.weight", QWEN36_GGUF_TYPE_F32, 1, 2048, 0, 0, &l->post_attn_norm, err, err_cap)) return false;
     if (!expect_layer_tensor(gf, i, "ffn_gate_inp.weight", QWEN36_GGUF_TYPE_F32, 2, 2048, 256, 0, &l->ffn_gate_inp, err, err_cap)) return false;
     if (!expect_layer_tensor(gf, i, "ffn_gate_inp_shexp.weight", QWEN36_GGUF_TYPE_F32, 1, 2048, 0, 0, &l->ffn_gate_inp_shexp, err, err_cap)) return false;
-    if (!expect_layer_tensor(gf, i, "ffn_gate_exps.weight", gate_up_type, 3, 2048, 512, 256, &l->ffn_gate_exps, err, err_cap)) return false;
-    if (!expect_layer_tensor(gf, i, "ffn_up_exps.weight", gate_up_type, 3, 2048, 512, 256, &l->ffn_up_exps, err, err_cap)) return false;
+    if (!expect_ffn_gate_up_tensor(gf, i, "ffn_gate_exps.weight", &l->ffn_gate_exps, err, err_cap)) return false;
+    if (!expect_ffn_gate_up_tensor(gf, i, "ffn_up_exps.weight", &l->ffn_up_exps, err, err_cap)) return false;
+    if (l->ffn_gate_exps->type != l->ffn_up_exps->type) {
+        set_err(err, err_cap, "layer %u ffn gate/up type mismatch: gate=%s up=%s",
+                i,
+                qwen36_gguf_type_name(l->ffn_gate_exps->type),
+                qwen36_gguf_type_name(l->ffn_up_exps->type));
+        return false;
+    }
     if (!expect_ffn_down_tensor(gf, i, &l->ffn_down_exps, err, err_cap)) return false;
     if (!expect_layer_tensor(gf, i, "ffn_gate_shexp.weight", QWEN36_GGUF_TYPE_Q8_0, 2, 2048, 512, 0, &l->ffn_gate_shexp, err, err_cap)) return false;
     if (!expect_layer_tensor(gf, i, "ffn_up_shexp.weight", QWEN36_GGUF_TYPE_Q8_0, 2, 2048, 512, 0, &l->ffn_up_shexp, err, err_cap)) return false;

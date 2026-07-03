@@ -380,6 +380,12 @@ def selected_template_tensors(reader: GGUFReader, only: set[str], limit: int | N
             yield tensor
 
 
+def template_storage_shape(tensor) -> tuple[int, ...]:
+    # GGUFReader exposes logical GGUF-order dims. GGUFWriter.add_tensor expects
+    # storage-order raw_shape and writes its reverse into tensor metadata.
+    return tuple(int(x) for x in reversed(tensor.shape))
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="Experimental Qwen3.6-35B-A3B exporter with selectable quantization profile")
     ap.add_argument("--hf", required=True, help="HF safetensors directory")
@@ -447,21 +453,22 @@ def main() -> int:
         if not rewrite:
             payload = np.ascontiguousarray(tensor.data)
             total_bytes += int(payload.nbytes)
+            raw_shape = template_storage_shape(tensor)
             if writer is not None:
                 if tensor.tensor_type == GGMLQuantizationType.F32:
-                    writer.add_tensor(tensor.name, payload, raw_shape=tensor.shape)
+                    writer.add_tensor(tensor.name, payload, raw_shape=raw_shape)
                 else:
                     writer.add_tensor(
                         tensor.name,
                         payload.view(np.int8),
-                        raw_shape=tensor.shape,
+                        raw_shape=raw_shape,
                         raw_dtype=tensor.tensor_type,
                     )
             print(
                 f"tensor: {tensor.name} "
                 f"profile={args.profile} "
                 f"type=template:{tensor.tensor_type.name.lower()} raw_shape={tuple(int(x) for x in tensor.shape)} "
-                f"storage_shape=template_copy "
+                f"storage_shape={raw_shape} "
                 f"bytes={payload.nbytes}"
             )
         else:

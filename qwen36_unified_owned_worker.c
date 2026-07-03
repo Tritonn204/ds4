@@ -699,6 +699,7 @@ static int ensure_full_layer_decode_scratch(full_layer_state *st, char *err, siz
     const uint64_t router_logits_bytes = (uint64_t)ROUTER_COUNT * sizeof(float);
     const uint64_t shared_bytes = (uint64_t)FULL_INTER * sizeof(float);
     const uint64_t topk = 8u;
+    const uint64_t expert_bytes = topk * shared_bytes;
     if (!st) return 0;
 
     if (!st->step_attn_in) st->step_attn_in = (float *)malloc((size_t)hidden_bytes);
@@ -731,9 +732,9 @@ static int ensure_full_layer_decode_scratch(full_layer_state *st, char *err, siz
     if (!st->ffn_shared_up_gpu) st->ffn_shared_up_gpu = ds4_gpu_tensor_alloc(shared_bytes);
     if (!st->ffn_shared_mid_gpu) st->ffn_shared_mid_gpu = ds4_gpu_tensor_alloc(shared_bytes);
     if (!st->ffn_shared_out_gpu) st->ffn_shared_out_gpu = ds4_gpu_tensor_alloc(hidden_bytes);
-    if (!st->ffn_expert_gate_gpu) st->ffn_expert_gate_gpu = ds4_gpu_tensor_alloc(shared_bytes);
-    if (!st->ffn_expert_up_gpu) st->ffn_expert_up_gpu = ds4_gpu_tensor_alloc(shared_bytes);
-    if (!st->ffn_expert_mid_gpu) st->ffn_expert_mid_gpu = ds4_gpu_tensor_alloc(shared_bytes);
+    if (!st->ffn_expert_gate_gpu) st->ffn_expert_gate_gpu = ds4_gpu_tensor_alloc(expert_bytes);
+    if (!st->ffn_expert_up_gpu) st->ffn_expert_up_gpu = ds4_gpu_tensor_alloc(expert_bytes);
+    if (!st->ffn_expert_mid_gpu) st->ffn_expert_mid_gpu = ds4_gpu_tensor_alloc(expert_bytes);
     if (!st->ffn_expert_down_gpu) st->ffn_expert_down_gpu = ds4_gpu_tensor_alloc(topk * hidden_bytes);
     if (!st->ffn_routed_out_gpu) st->ffn_routed_out_gpu = ds4_gpu_tensor_alloc(hidden_bytes);
     if (!st->ffn_router_selected_gpu) st->ffn_router_selected_gpu = ds4_gpu_tensor_alloc(topk * sizeof(int32_t));
@@ -1094,6 +1095,10 @@ static uint64_t tensor_row_bytes(const qwen36_gguf_tensor *t, uint32_t cols) {
         return (uint64_t)(cols / QK_K) * sizeof(qwen36_block_q5_K);
     case QWEN36_GGUF_TYPE_Q6_K:
         return (uint64_t)(cols / QK_K) * sizeof(qwen36_block_q6_K);
+    case QWEN36_GGUF_TYPE_IQ2_XXS:
+        return (uint64_t)(cols / QK_K) * 66u;
+    case QWEN36_GGUF_TYPE_IQ2_S:
+        return (uint64_t)(cols / QK_K) * 82u;
     default:
         return 0;
     }
@@ -2413,6 +2418,7 @@ static int ensure_layer_gpu_step_scratch(const live_fixture *fx, layer_step_scra
     const uint64_t out_in_bytes = (uint64_t)fx->value_dim * sizeof(float);
     const uint64_t router_logits_bytes = (uint64_t)ROUTER_COUNT * sizeof(float);
     const uint64_t inter_bytes = (uint64_t)fx->inter * sizeof(float);
+    const uint64_t expert_bytes = (uint64_t)fx->topk * inter_bytes;
     if (sc->input_gpu) return 1;
     sc->input_gpu = ds4_gpu_tensor_alloc(hidden_bytes);
     sc->input_ln_gpu = ds4_gpu_tensor_alloc(hidden_bytes);
@@ -2427,9 +2433,9 @@ static int ensure_layer_gpu_step_scratch(const live_fixture *fx, layer_step_scra
     sc->shared_up_gpu = ds4_gpu_tensor_alloc(inter_bytes);
     sc->shared_mid_gpu = ds4_gpu_tensor_alloc(inter_bytes);
     sc->shared_out_gpu = ds4_gpu_tensor_alloc(hidden_bytes);
-    sc->expert_gate_gpu = ds4_gpu_tensor_alloc(inter_bytes);
-    sc->expert_up_gpu = ds4_gpu_tensor_alloc(inter_bytes);
-    sc->expert_mid_gpu = ds4_gpu_tensor_alloc(inter_bytes);
+    sc->expert_gate_gpu = ds4_gpu_tensor_alloc(expert_bytes);
+    sc->expert_up_gpu = ds4_gpu_tensor_alloc(expert_bytes);
+    sc->expert_mid_gpu = ds4_gpu_tensor_alloc(expert_bytes);
     sc->expert_down_gpu = ds4_gpu_tensor_alloc((uint64_t)fx->topk * hidden_bytes);
     sc->routed_out_gpu = ds4_gpu_tensor_alloc(hidden_bytes);
     sc->router_selected_gpu = ds4_gpu_tensor_alloc((uint64_t)fx->topk * sizeof(int32_t));
