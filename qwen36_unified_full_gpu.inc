@@ -559,6 +559,7 @@ static int run_gpu_ffn_from_residual_unified(
     const uint64_t seq_hidden_bytes = (uint64_t)n_tokens * hidden * sizeof(float);
     const uint64_t router_logits_bytes = (uint64_t)n_tokens * ROUTER_COUNT * sizeof(float);
     const uint64_t shared_bytes = (uint64_t)n_tokens * shared_dim * sizeof(float);
+    const uint64_t expert_bytes = (uint64_t)n_tokens * topk * shared_dim * sizeof(float);
     const uint64_t gate_row_bytes = full_gpu_tensor_row_bytes(layer->ffn_gate_exps, hidden);
     const uint64_t gate_expert_bytes = gate_row_bytes * FULL_INTER;
     const uint64_t down_row_bytes = full_gpu_tensor_row_bytes(layer->ffn_down_exps, FULL_INTER);
@@ -584,7 +585,6 @@ static int run_gpu_ffn_from_residual_unified(
     const int use_routed_moe =
         full_gpu_env_enabled_default_on("QWEN36_FULL_GPU_ROUTED_MOE") &&
         n_tokens == 1u &&
-        !g_qwen36_full_gpu_prefill_mode &&
         qwen36_routed_moe_supported_types(layer->ffn_gate_exps->type,
                                           layer->ffn_down_exps->type);
     const int use_shared_gpu = full_gpu_ffn_shared_q8_supported(layer);
@@ -646,9 +646,9 @@ static int run_gpu_ffn_from_residual_unified(
         shared_up = ds4_gpu_tensor_alloc(shared_bytes);
         shared_mid = ds4_gpu_tensor_alloc(shared_bytes);
         shared_out = ds4_gpu_tensor_alloc(seq_hidden_bytes);
-        expert_gate = ds4_gpu_tensor_alloc(shared_bytes);
-        expert_up = ds4_gpu_tensor_alloc(shared_bytes);
-        expert_mid = ds4_gpu_tensor_alloc(shared_bytes);
+        expert_gate = ds4_gpu_tensor_alloc(expert_bytes);
+        expert_up = ds4_gpu_tensor_alloc(expert_bytes);
+        expert_mid = ds4_gpu_tensor_alloc(expert_bytes);
         expert_down = ds4_gpu_tensor_alloc(topk * seq_hidden_bytes);
         routed_out = ds4_gpu_tensor_alloc(seq_hidden_bytes);
         router_selected = ds4_gpu_tensor_alloc((uint64_t)n_tokens * topk * sizeof(int32_t));
