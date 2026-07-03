@@ -1,0 +1,281 @@
+{
+  "schema_name": "ds4_inferred_runtime_contract",
+  "schema_version": 1,
+  "source": {
+    "kind": "code_inference",
+    "repo": "ds4",
+    "files": [
+      "ds4.c",
+      "ds4.h"
+    ],
+    "note": "Inferred from code paths only. No DeepSeek GGUF was loaded."
+  },
+  "artifact": {
+    "container_format": "GGUF v3",
+    "load_style": "mmap header+metadata+tensor directory; tensor payload stays mapped",
+    "required_top_level_metadata": [
+      "general.name",
+      "general.architecture"
+    ]
+  },
+  "shape_contract": {
+    "variant_selection": {
+      "kind": "exact_shape_match",
+      "variants": [
+        "DeepSeek V4 Flash",
+        "DeepSeek V4 Pro"
+      ]
+    },
+    "required_fields": [
+      "deepseek4.block_count",
+      "deepseek4.embedding_length",
+      "deepseek4.vocab_size",
+      "deepseek4.attention.head_count",
+      "deepseek4.attention.head_count_kv",
+      "deepseek4.attention.key_length",
+      "deepseek4.attention.value_length",
+      "deepseek4.rope.dimension_count",
+      "deepseek4.attention.q_lora_rank",
+      "deepseek4.attention.output_lora_rank",
+      "deepseek4.attention.output_group_count",
+      "deepseek4.expert_count",
+      "deepseek4.expert_used_count",
+      "deepseek4.expert_feed_forward_length",
+      "deepseek4.expert_shared_count",
+      "deepseek4.hash_layer_count",
+      "deepseek4.attention.sliding_window",
+      "deepseek4.attention.indexer.head_count",
+      "deepseek4.attention.indexer.key_length",
+      "deepseek4.attention.indexer.top_k",
+      "deepseek4.hyper_connection.count",
+      "deepseek4.hyper_connection.sinkhorn_iterations"
+    ],
+    "optional_but_validated_fields": [
+      "deepseek4.expert_group_count",
+      "deepseek4.expert_group_used_count",
+      "deepseek4.rope.scaling.original_context_length",
+      "deepseek4.rope.scaling.factor",
+      "deepseek4.rope.scaling.yarn_beta_fast",
+      "deepseek4.rope.scaling.yarn_beta_slow"
+    ]
+  },
+  "metadata_contract": {
+    "exact_scalar_requirements": [
+      "deepseek4.rope.freq_base",
+      "deepseek4.attention.compress_rope_freq_base",
+      "deepseek4.expert_weights_scale",
+      "deepseek4.attention.layer_norm_rms_epsilon",
+      "deepseek4.hyper_connection.epsilon",
+      "deepseek4.expert_weights_norm"
+    ],
+    "exact_array_requirements": [
+      "deepseek4.attention.compress_ratios",
+      "deepseek4.swiglu_clamp_exp"
+    ],
+    "semantic_notes": [
+      "compress_ratios must match a baked per-layer pattern for the selected variant",
+      "swiglu_clamp_exp must match a baked scalar across all layers",
+      "expert_group_count and expert_group_used_count are expected to be zero"
+    ]
+  },
+  "tensor_inventory_contract": {
+    "name_binding_style": "fixed string names bound into C structs",
+    "tensor_families": [
+      "token embedding",
+      "output head",
+      "hyper-connection",
+      "attention",
+      "attention compressor",
+      "indexer",
+      "FFN router",
+      "routed experts",
+      "shared expert"
+    ]
+  },
+  "layer_template": {
+    "common_per_layer": [
+      "blk.{i}.hc_attn_fn.weight",
+      "blk.{i}.hc_attn_scale.weight",
+      "blk.{i}.hc_attn_base.weight",
+      "blk.{i}.attn_norm.weight",
+      "blk.{i}.attn_q_a.weight",
+      "blk.{i}.attn_q_a_norm.weight",
+      "blk.{i}.attn_q_b.weight",
+      "blk.{i}.attn_kv.weight",
+      "blk.{i}.attn_kv_a_norm.weight",
+      "blk.{i}.attn_sinks.weight",
+      "blk.{i}.attn_output_a.weight",
+      "blk.{i}.attn_output_b.weight",
+      "blk.{i}.hc_ffn_fn.weight",
+      "blk.{i}.hc_ffn_scale.weight",
+      "blk.{i}.hc_ffn_base.weight",
+      "blk.{i}.ffn_norm.weight",
+      "blk.{i}.ffn_gate_inp.weight",
+      "blk.{i}.ffn_gate_exps.weight",
+      "blk.{i}.ffn_up_exps.weight",
+      "blk.{i}.ffn_down_exps.weight",
+      "blk.{i}.ffn_gate_shexp.weight",
+      "blk.{i}.ffn_up_shexp.weight",
+      "blk.{i}.ffn_down_shexp.weight"
+    ],
+    "optional_per_layer": [
+      "blk.{i}.exp_probs_b.bias"
+    ],
+    "conditional_per_layer": {
+      "compress_ratio_nonzero": [
+        "blk.{i}.attn_compressor_ape.weight",
+        "blk.{i}.attn_compressor_kv.weight",
+        "blk.{i}.attn_compressor_gate.weight",
+        "blk.{i}.attn_compressor_norm.weight"
+      ],
+      "compress_ratio_equals_4": [
+        "blk.{i}.indexer.attn_q_b.weight",
+        "blk.{i}.indexer.proj.weight",
+        "blk.{i}.indexer_compressor_ape.weight",
+        "blk.{i}.indexer_compressor_kv.weight",
+        "blk.{i}.indexer_compressor_gate.weight",
+        "blk.{i}.indexer_compressor_norm.weight"
+      ],
+      "early_hash_routing_layers_only": [
+        "blk.{i}.ffn_gate_tid2eid.weight"
+      ]
+    }
+  },
+  "output_head_contract": {
+    "required_tensors": [
+      "output_hc_base.weight",
+      "output_hc_fn.weight",
+      "output_hc_scale.weight",
+      "output_norm.weight",
+      "output.weight"
+    ],
+    "semantics": "Collapse hyper-connection streams, RMS norm, project to logits"
+  },
+  "attention_contract": {
+    "style": [
+      "single KV head replicated across attention heads",
+      "Q LoRA path",
+      "grouped output projection",
+      "raw sliding-window attention cache",
+      "optional compressed attention rows",
+      "optional ratio-4 indexer over compressed rows"
+    ],
+    "semantic_clues": {
+      "q_path": [
+        "attn_q_a",
+        "attn_q_a_norm",
+        "attn_q_b"
+      ],
+      "kv_path": [
+        "attn_kv",
+        "attn_kv_a_norm"
+      ],
+      "sinks": [
+        "attn_sinks"
+      ],
+      "compressed_cache_path": [
+        "attn_compressor_*"
+      ],
+      "indexer_path": [
+        "indexer.*",
+        "indexer_compressor_*"
+      ]
+    }
+  },
+  "routing_contract": {
+    "overall_style": "shared expert plus routed experts",
+    "early_layers": {
+      "selection": "hash by token id",
+      "table": "ffn_gate_tid2eid"
+    },
+    "later_layers": {
+      "selection": "biased top-k over router probabilities",
+      "router_input": "ffn_gate_inp",
+      "optional_bias": "exp_probs_b.bias"
+    },
+    "weighting": {
+      "prob_transform": "sqrt(softplus(logit))",
+      "normalization": "renormalize selected experts only",
+      "scale": "expert_weights_scale"
+    },
+    "expert_count_behavior": {
+      "selected_experts_per_token": 6,
+      "shared_expert_count": 1
+    }
+  },
+  "ffn_contract": {
+    "shared_expert": {
+      "style": "always-on SwiGLU MLP",
+      "tensor_groups": [
+        "ffn_gate_shexp",
+        "ffn_up_shexp",
+        "ffn_down_shexp"
+      ]
+    },
+    "routed_experts": {
+      "style": "gate/up then SwiGLU then down",
+      "tensor_groups": [
+        "ffn_gate_exps",
+        "ffn_up_exps",
+        "ffn_down_exps"
+      ]
+    }
+  },
+  "state_cache_contract": {
+    "per_layer_state": [
+      "raw_kv ring buffer",
+      "attn_comp_kv append-only compressed rows",
+      "attn_state_kv compressor frontier",
+      "attn_state_score compressor frontier scores"
+    ],
+    "ratio_4_extra_state": [
+      "index_comp_kv",
+      "index_state_kv",
+      "index_state_score"
+    ],
+    "session_level_state": [
+      "checkpoint token prefix",
+      "logits",
+      "backend-specific live state"
+    ]
+  },
+  "quant_contract": {
+    "dense_plain": [
+      "f16",
+      "f32"
+    ],
+    "dense_matmul": [
+      "q8_0"
+    ],
+    "routed_expert_weights": [
+      "iq2_xxs",
+      "q2_k",
+      "q4_k"
+    ],
+    "temporary_activation_quant": [
+      "q8_k"
+    ],
+    "notes": [
+      "gate/up routed experts must use the same quant type within a layer",
+      "Q4_K appears as an optional higher-memory routed expert format"
+    ]
+  },
+  "execution_contract": {
+    "prefill": "layer-major batched prefill",
+    "decode": "single-token autoregressive decode with persistent state",
+    "sampling": [
+      "argmax path",
+      "temperature/top-k/top-p/min-p sampler"
+    ],
+    "backends": [
+      "CPU reference",
+      "Metal graph",
+      "CUDA/ROCm graph"
+    ]
+  },
+  "unknowns_and_limits": [
+    "This schema reflects ds4's runtime contract, not a general DeepSeek ontology",
+    "Some semantics are inferred from tensor names and execution code rather than exporter metadata",
+    "MTP support exists in ds4, but the primary runtime contract described here is the main model path"
+  ]
+}

@@ -59,6 +59,8 @@ GGML_QUANT_SIZES = {
     8: (32, 34, "Q8_0"),
     10: (256, 84, "Q2_K"),
     12: (256, 144, "Q4_K"),
+    13: (256, 176, "Q5_K"),
+    14: (256, 210, "Q6_K"),
     16: (256, 66, "IQ2_XXS"),
     26: (1, 4, "I32"),
 }
@@ -244,16 +246,30 @@ def parse_layer_set(spec: str) -> set[int]:
     return layers
 
 
-def should_take_donor(name: str, q4_layers: set[int]) -> bool:
+def parse_kind_set(spec: str) -> set[str]:
+    kinds = {part.strip() for part in spec.split(",") if part.strip()}
+    if not kinds:
+        raise ValueError("no tensor kinds selected")
+    bad = kinds - {"gate", "up", "down"}
+    if bad:
+        raise ValueError(f"unsupported tensor kinds: {sorted(bad)}")
+    return kinds
+
+
+def should_take_donor(name: str, q4_layers: set[int], kinds: set[str]) -> bool:
     match = EXPERT_TENSOR_RE.match(name)
-    return match is not None and int(match.group(1)) in q4_layers
+    return (
+        match is not None
+        and int(match.group(1)) in q4_layers
+        and match.group(2) in kinds
+    )
 
 
 def qtype_name(ggml_type: int) -> str:
     return GGML_QUANT_SIZES.get(ggml_type, (0, 0, f"type_{ggml_type}"))[2]
 
 
-def build_plan(base: GGUFInfo, donor: GGUFInfo, q4_layers: set[int]) -> list[SplicePlan]:
+def build_plan(base: GGUFInfo, donor: GGUFInfo, q4_layers: set[int], kinds: set[str]) -> list[SplicePlan]:
     if base.version != donor.version:
         raise ValueError(f"GGUF version mismatch: base={base.version} donor={donor.version}")
     if base.tensor_count != donor.tensor_count:
@@ -267,9 +283,10 @@ def build_plan(base: GGUFInfo, donor: GGUFInfo, q4_layers: set[int]) -> list[Spl
         donor_tensor = donor.tensor_by_name.get(base_tensor.name)
         if donor_tensor is None:
             raise ValueError(f"donor is missing tensor {base_tensor.name}")
-        if base_tensor.dims != donor_tensor.dims:
-            raise ValueError(f"shape mismatch for {base_tensor.name}: {base_tensor.dims} vs {donor_tensor.dims}")
-        use_donor = should_take_donor(base_tensor.name, q4_layers)
+        use_donor = should_take_donor(base_tensor.name, q4_layers, kinds)
+        if use_donor:
+            if base_tensor.dims != donor_tensor.dims:
+                raise ValueError(f"shape mismatch for donor tensor {base_tensor.name}: {base_tensor.dims} vs {donor_tensor.dims}")
         source_tensor = donor_tensor if use_donor else base_tensor
         plan.append(SplicePlan(
             name=base_tensor.name,
@@ -374,16 +391,20 @@ def main() -> int:
     parser.add_argument("--donor", required=True, type=Path, help="donor GGUF used for selected routed expert layers")
     parser.add_argument("--out", required=True, type=Path, help="output mixed GGUF")
     parser.add_argument("--q4-layers", required=True, help="comma-separated layer IDs/ranges to take from donor, e.g. 37-42")
+    parser.add_argument("--tensor-kinds", default="gate,up,down",
+                        help="comma-separated routed expert tensor kinds to take from donor: gate,up,down")
     parser.add_argument("--dry-run", action="store_true", help="print the plan without writing the output")
     parser.add_argument("--force", action="store_true", help="overwrite --out if it already exists")
     args = parser.parse_args()
 
     q4_layers = parse_layer_set(args.q4_layers)
+    kinds = parse_kind_set(args.tensor_kinds)
     print("q4 layers:", ",".join(str(x) for x in sorted(q4_layers)))
+    print("tensor kinds:", ",".join(sorted(kinds)))
 
     base = parse_gguf(args.base)
     donor = parse_gguf(args.donor)
-    plan = build_plan(base, donor, q4_layers)
+    plan = build_plan(base, donor, q4_layers, kinds)
     summarize(base, donor, plan)
 
     if args.dry_run:

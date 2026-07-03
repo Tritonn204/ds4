@@ -1,0 +1,12 @@
+Review this implementation direction for a Qwen narrow runtime:
+
+- live router logits each step
+- live top-k expert selection
+- lazy expert decode from GGUF on first use
+- in-process expert cache with no eviction in v1
+- HF tail splice for validation
+
+Produce:
+1. One paragraph explaining the strongest upside.
+2. One paragraph explaining the biggest technical risk.
+3. A numbered list of 5 implementation checkpoints.

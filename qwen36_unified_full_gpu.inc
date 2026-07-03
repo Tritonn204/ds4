@@ -64,8 +64,16 @@ static int full_gpu_env_enabled_default_off(const char *name) {
              strcmp(env, "NO") == 0);
 }
 
+static int g_qwen36_full_gpu_prefill_mode = 0;
+
+static int qwen36_routed_moe_supported_types(uint32_t gate_type, uint32_t down_type) {
+    return (gate_type == QWEN36_GGUF_TYPE_Q4_K && down_type == QWEN36_GGUF_TYPE_Q4_K) ||
+           (gate_type == QWEN36_GGUF_TYPE_IQ2_XXS && down_type == QWEN36_GGUF_TYPE_Q2_K) ||
+           (gate_type == QWEN36_GGUF_TYPE_Q2_K && down_type == QWEN36_GGUF_TYPE_Q2_K);
+}
+
 static int load_small_cache(const qwen36_gguf_file *gf,
-                            const qwen36_35a3b_q8_layer *layer,
+                            const qwen36_contract_layer *layer,
                             full_layer_small_cache *cache,
                             char *err,
                             size_t err_cap) {
@@ -175,7 +183,7 @@ static void reorder_out_in_hf_to_gg(float *dst, const float *src, uint32_t seq_l
 }
 
 static int run_gpu_q8_qkv_split_rowwise(const mapped_file *mf,
-                                        const qwen36_35a3b_q8_layer *layer,
+                                        const qwen36_contract_layer *layer,
                                         uint32_t in_dim,
                                         uint32_t key_dim,
                                         uint32_t value_dim,
@@ -201,7 +209,7 @@ cleanup:
 
 static int run_hybrid_layer_prefill_gpuproj_batched(const live_fixture *fx,
                                                     const qwen36_gguf_file *gf,
-                                                    const qwen36_35a3b_q8_layer *layer,
+                                                    const qwen36_contract_layer *layer,
                                                     const mapped_file *mf,
                                                     layer_runtime *ls,
                                                     uint32_t seq_len,
@@ -278,18 +286,18 @@ static int run_hybrid_layer_prefill_gpuproj_batched(const live_fixture *fx,
         snprintf(err, err_cap, "gpu prefill rmsnorm failed blk.%u", fx->layer);
         goto fail;
     }
-    if (ds4_gpu_matmul_q8_0_tensor(z_gpu, mf->map, mf->size,
-                                   layer->attn_gate->abs_offset, fx->hidden, fx->value_dim, input_ln_gpu, seq_len) == 0) {
+    if (hybrid_gpu_dense_matmul_tensor(z_gpu, mf, layer->attn_gate,
+                                       fx->hidden, fx->value_dim, input_ln_gpu, seq_len) == 0) {
         snprintf(err, err_cap, "gpu prefill z matmul failed blk.%u", fx->layer);
         goto fail;
     }
-    if (ds4_gpu_matmul_q8_0_tensor(a_gpu, mf->map, mf->size,
-                                   layer->ssm_alpha->abs_offset, fx->hidden, fx->num_v_heads, input_ln_gpu, seq_len) == 0) {
+    if (hybrid_gpu_dense_matmul_tensor(a_gpu, mf, layer->ssm_alpha,
+                                       fx->hidden, fx->num_v_heads, input_ln_gpu, seq_len) == 0) {
         snprintf(err, err_cap, "gpu prefill a matmul failed blk.%u", fx->layer);
         goto fail;
     }
-    if (ds4_gpu_matmul_q8_0_tensor(b_gpu, mf->map, mf->size,
-                                   layer->ssm_beta->abs_offset, fx->hidden, fx->num_v_heads, input_ln_gpu, seq_len) == 0) {
+    if (hybrid_gpu_dense_matmul_tensor(b_gpu, mf, layer->ssm_beta,
+                                       fx->hidden, fx->num_v_heads, input_ln_gpu, seq_len) == 0) {
         snprintf(err, err_cap, "gpu prefill b matmul failed blk.%u", fx->layer);
         goto fail;
     }
@@ -400,8 +408,8 @@ static int run_hybrid_layer_prefill_gpuproj_batched(const live_fixture *fx,
         snprintf(err, err_cap, "gpu prefill out_proj begin failed blk.%u", fx->layer);
         goto fail;
     }
-    if (ds4_gpu_matmul_q8_0_tensor(out_proj_gpu, mf->map, mf->size,
-                                   layer->ssm_out->abs_offset, fx->value_dim, fx->hidden, out_in_gpu, seq_len) == 0) {
+    if (hybrid_gpu_dense_matmul_tensor(out_proj_gpu, mf, layer->ssm_out,
+                                       fx->value_dim, fx->hidden, out_in_gpu, seq_len) == 0) {
         snprintf(err, err_cap, "gpu prefill out_proj failed blk.%u", fx->layer);
         goto fail;
     }
@@ -494,9 +502,51 @@ static int full_gpu_env_enabled_default_on(const char *name) {
     return !(v && strcmp(v, "0") == 0);
 }
 
+static uint64_t full_gpu_tensor_row_bytes(const qwen36_gguf_tensor *t, uint32_t cols) {
+    if (!t) return 0;
+    if (t->type == QWEN36_GGUF_TYPE_Q8_0) return q8_row_bytes(cols);
+    if (t->type == QWEN36_GGUF_TYPE_Q2_K) return ((uint64_t)cols / 256u) * 84u;
+    if (t->type == QWEN36_GGUF_TYPE_Q4_K) return ((uint64_t)cols / 256u) * 144u;
+    if (t->type == QWEN36_GGUF_TYPE_Q5_K) return ((uint64_t)cols / 256u) * 176u;
+    if (t->type == QWEN36_GGUF_TYPE_Q6_K) return ((uint64_t)cols / 256u) * 210u;
+    if (t->type == QWEN36_GGUF_TYPE_IQ2_XXS) return ((uint64_t)cols / 256u) * 66u;
+    if (t->type == QWEN36_GGUF_TYPE_IQ2_S) return ((uint64_t)cols / 256u) * 82u;
+    return 0;
+}
+
+static int full_gpu_ffn_shared_q8_supported(const qwen36_contract_layer *layer) {
+    return layer->ffn_gate_shexp &&
+           layer->ffn_up_shexp &&
+           layer->ffn_down_shexp &&
+           layer->ffn_gate_shexp->type == QWEN36_GGUF_TYPE_Q8_0 &&
+           layer->ffn_up_shexp->type == QWEN36_GGUF_TYPE_Q8_0 &&
+           layer->ffn_down_shexp->type == QWEN36_GGUF_TYPE_Q8_0;
+}
+
+static int full_gpu_ffn_routed_q8_supported(const qwen36_contract_layer *layer) {
+    return layer->ffn_gate_exps &&
+           layer->ffn_up_exps &&
+           layer->ffn_down_exps &&
+           layer->ffn_gate_exps->type == QWEN36_GGUF_TYPE_Q8_0 &&
+           layer->ffn_up_exps->type == QWEN36_GGUF_TYPE_Q8_0 &&
+           layer->ffn_down_exps->type == QWEN36_GGUF_TYPE_Q8_0;
+}
+
+static int full_gpu_ffn_routed_decoded_supported(const qwen36_contract_layer *layer) {
+    return layer->ffn_gate_exps &&
+           layer->ffn_up_exps &&
+           layer->ffn_down_exps &&
+           gpu_decoded_expert_type_supported(layer->ffn_gate_exps->type) &&
+           gpu_decoded_expert_type_supported(layer->ffn_up_exps->type) &&
+           gpu_decoded_expert_type_supported(layer->ffn_down_exps->type);
+}
+
 static int run_gpu_ffn_from_residual_unified(
+        const qwen36_gguf_file *gf,
         const mapped_file *mf,
-        const qwen36_35a3b_q8_layer *layer,
+        const qwen36_contract_layer *layer,
+        uint32_t layer_index,
+        full_layer_cache *cpu_cache,
         const float *shared_gate_inp_w,
         full_layer_state *state,
         uint32_t n_tokens,
@@ -509,26 +559,64 @@ static int run_gpu_ffn_from_residual_unified(
     const uint64_t seq_hidden_bytes = (uint64_t)n_tokens * hidden * sizeof(float);
     const uint64_t router_logits_bytes = (uint64_t)n_tokens * ROUTER_COUNT * sizeof(float);
     const uint64_t shared_bytes = (uint64_t)n_tokens * shared_dim * sizeof(float);
-    const uint64_t gate_row_bytes = q8_row_bytes(hidden);
+    const uint64_t gate_row_bytes = full_gpu_tensor_row_bytes(layer->ffn_gate_exps, hidden);
     const uint64_t gate_expert_bytes = gate_row_bytes * FULL_INTER;
-    const uint64_t down_row_bytes = q8_row_bytes(FULL_INTER);
+    const uint64_t down_row_bytes = full_gpu_tensor_row_bytes(layer->ffn_down_exps, FULL_INTER);
     const uint64_t down_expert_bytes = down_row_bytes * hidden;
     ds4_gpu_tensor *residual = NULL, *post = NULL, *router_logits = NULL;
     ds4_gpu_tensor *shared_gate = NULL, *shared_up = NULL, *shared_mid = NULL, *shared_out = NULL;
     ds4_gpu_tensor *expert_gate = NULL, *expert_up = NULL, *expert_mid = NULL, *expert_down = NULL;
+    ds4_gpu_tensor *routed_out = NULL, *router_selected = NULL, *router_weights = NULL;
     float *router_logits_cpu = NULL, *shared_out_cpu = NULL, *expert_down_cpu = NULL, *routed_out_cpu = NULL, *post_cpu = NULL;
+    float *expert_gate_cpu = NULL, *expert_up_cpu = NULL, *expert_mid_cpu = NULL;
     uint32_t *router_selected_cpu = NULL;
     float *router_weights_cpu = NULL;
     uint32_t union_ids[ROUTER_COUNT];
     int32_t union_pos[ROUTER_COUNT];
     uint32_t n_union = 0;
+    char ffn_err[256];
     int ok = 0;
     const int use_batched = full_gpu_env_enabled_default_on("QWEN36_FULL_GPU_FFN_BATCHED_EXPERTS");
-    const int use_persistent = full_gpu_env_enabled_default_on("QWEN36_FULL_GPU_PERSISTENT_SCRATCH");
+    const int use_persistent =
+        full_gpu_env_enabled_default_on("QWEN36_FULL_GPU_PERSISTENT_SCRATCH") &&
+        state != NULL &&
+        n_tokens == 1u;
+    const int use_routed_moe =
+        full_gpu_env_enabled_default_on("QWEN36_FULL_GPU_ROUTED_MOE") &&
+        n_tokens == 1u &&
+        !g_qwen36_full_gpu_prefill_mode &&
+        qwen36_routed_moe_supported_types(layer->ffn_gate_exps->type,
+                                          layer->ffn_down_exps->type);
+    const int use_shared_gpu = full_gpu_ffn_shared_q8_supported(layer);
+    const int use_q8_expert_gpu = full_gpu_ffn_routed_q8_supported(layer);
+    const int use_decoded_expert_gpu =
+        full_gpu_env_enabled_default_off("QWEN36_GPU_DECODED_EXPERTS") &&
+        !use_routed_moe && !use_q8_expert_gpu &&
+        full_gpu_ffn_routed_decoded_supported(layer);
+    const int use_cpu_experts = !use_routed_moe && !use_q8_expert_gpu && !use_decoded_expert_gpu;
+    const int path_audit = getenv("QWEN36_PATH_AUDIT") != NULL;
     (void)unused_timing;
 
+    if (path_audit) {
+        fprintf(stderr,
+                "qwen36_path full layer=%u shared_gpu=%d routed_moe=%d q8_expert_gpu=%d decoded_expert_gpu=%d cpu_experts=%d gate=%s up=%s down=%s shared_gate=%s shared_up=%s shared_down=%s n_tokens=%u\n",
+                layer_index,
+                use_shared_gpu,
+                use_routed_moe,
+                use_q8_expert_gpu,
+                use_decoded_expert_gpu,
+                use_cpu_experts,
+                qwen36_gguf_type_name(layer->ffn_gate_exps->type),
+                qwen36_gguf_type_name(layer->ffn_up_exps->type),
+                qwen36_gguf_type_name(layer->ffn_down_exps->type),
+                qwen36_gguf_type_name(layer->ffn_gate_shexp->type),
+                qwen36_gguf_type_name(layer->ffn_up_shexp->type),
+                qwen36_gguf_type_name(layer->ffn_down_shexp->type),
+                n_tokens);
+        fflush(stderr);
+    }
+
     if (use_persistent) {
-        if (!state || n_tokens != 1u) return 0;
         residual = state->ffn_residual_gpu;
         post = state->ffn_post_gpu;
         router_logits = state->ffn_router_logits_gpu;
@@ -540,6 +628,9 @@ static int run_gpu_ffn_from_residual_unified(
         expert_up = state->ffn_expert_up_gpu;
         expert_mid = state->ffn_expert_mid_gpu;
         expert_down = state->ffn_expert_down_gpu;
+        routed_out = state->ffn_routed_out_gpu;
+        router_selected = state->ffn_router_selected_gpu;
+        router_weights = state->ffn_router_weights_gpu;
         router_logits_cpu = state->ffn_router_logits_cpu;
         shared_out_cpu = state->ffn_shared_out_cpu;
         expert_down_cpu = state->ffn_expert_down_cpu;
@@ -559,6 +650,9 @@ static int run_gpu_ffn_from_residual_unified(
         expert_up = ds4_gpu_tensor_alloc(shared_bytes);
         expert_mid = ds4_gpu_tensor_alloc(shared_bytes);
         expert_down = ds4_gpu_tensor_alloc(topk * seq_hidden_bytes);
+        routed_out = ds4_gpu_tensor_alloc(seq_hidden_bytes);
+        router_selected = ds4_gpu_tensor_alloc((uint64_t)n_tokens * topk * sizeof(int32_t));
+        router_weights = ds4_gpu_tensor_alloc((uint64_t)n_tokens * topk * sizeof(float));
         router_logits_cpu = (float *)malloc((size_t)router_logits_bytes);
         shared_out_cpu = (float *)malloc((size_t)seq_hidden_bytes);
         expert_down_cpu = (float *)malloc((size_t)seq_hidden_bytes);
@@ -569,8 +663,20 @@ static int run_gpu_ffn_from_residual_unified(
     }
 
     if (!residual || !post || !router_logits || !shared_gate || !shared_up || !shared_mid || !shared_out ||
-        !expert_gate || !expert_up || !expert_mid || !expert_down || !router_logits_cpu || !shared_out_cpu ||
+        !expert_gate || !expert_up || !expert_mid || !expert_down || !routed_out || !router_selected || !router_weights ||
+        !router_logits_cpu || !shared_out_cpu ||
         !expert_down_cpu || !routed_out_cpu || !post_cpu || !router_selected_cpu || !router_weights_cpu) goto cleanup;
+    if (!use_shared_gpu || use_cpu_experts) {
+        char ffn_err[256];
+        if (!cpu_cache || !gf) goto cleanup;
+        if (!ensure_full_layer_loaded(gf, layer, cpu_cache, ffn_err, sizeof(ffn_err))) goto cleanup;
+    }
+    if (use_cpu_experts) {
+        expert_gate_cpu = (float *)malloc((size_t)shared_dim * sizeof(float));
+        expert_up_cpu = (float *)malloc((size_t)shared_dim * sizeof(float));
+        expert_mid_cpu = (float *)malloc((size_t)shared_dim * sizeof(float));
+        if (!expert_gate_cpu || !expert_up_cpu || !expert_mid_cpu) goto cleanup;
+    }
 
     memset(routed_out_cpu, 0, (size_t)n_tokens * hidden * sizeof(float));
 
@@ -582,21 +688,38 @@ static int run_gpu_ffn_from_residual_unified(
     if (ds4_gpu_matmul_f32_tensor(router_logits, mf->map, mf->size,
                                   layer->ffn_gate_inp->abs_offset,
                                   hidden, ROUTER_COUNT, post, n_tokens) == 0) goto cleanup;
-    if (ds4_gpu_shared_gate_up_swiglu_q8_0_tensor(shared_gate, shared_up, shared_mid,
-                                                  mf->map, mf->size,
-                                                  layer->ffn_gate_shexp->abs_offset,
-                                                  layer->ffn_up_shexp->abs_offset,
-                                                  hidden, shared_dim, post,
-                                                  QWEN_SWIGLU_CLAMP) == 0) goto cleanup;
-    if (ds4_gpu_matmul_q8_0_tensor(shared_out, mf->map, mf->size,
-                                   layer->ffn_down_shexp->abs_offset,
-                                   shared_dim, hidden, shared_mid, n_tokens) == 0) goto cleanup;
+    if (use_shared_gpu) {
+        if (ds4_gpu_shared_gate_up_swiglu_q8_0_tensor(shared_gate, shared_up, shared_mid,
+                                                      mf->map, mf->size,
+                                                      layer->ffn_gate_shexp->abs_offset,
+                                                      layer->ffn_up_shexp->abs_offset,
+                                                      hidden, shared_dim, post,
+                                                      QWEN_SWIGLU_CLAMP) == 0) goto cleanup;
+        if (ds4_gpu_matmul_q8_0_tensor(shared_out, mf->map, mf->size,
+                                       layer->ffn_down_shexp->abs_offset,
+                                       shared_dim, hidden, shared_mid, n_tokens) == 0) goto cleanup;
+    }
     if (ds4_gpu_end_commands() == 0) goto cleanup;
 
     memset(union_pos, 0xff, sizeof(union_pos));
     if (ds4_gpu_tensor_read(router_logits, 0, router_logits_cpu, router_logits_bytes) == 0) goto cleanup;
-    if (ds4_gpu_tensor_read(shared_out, 0, shared_out_cpu, seq_hidden_bytes) == 0) goto cleanup;
     if (ds4_gpu_tensor_read(post, 0, post_cpu, seq_hidden_bytes) == 0) goto cleanup;
+    if (use_shared_gpu) {
+        if (ds4_gpu_tensor_read(shared_out, 0, shared_out_cpu, seq_hidden_bytes) == 0) goto cleanup;
+    } else {
+        for (uint32_t t = 0; t < n_tokens; ++t) {
+            const float *post_row = post_cpu + (size_t)t * hidden;
+            float *shared_row = shared_out_cpu + (size_t)t * hidden;
+            matvec(cpu_cache->gate_shexp_w, post_row, expert_gate_cpu, shared_dim, hidden);
+            matvec(cpu_cache->up_shexp_w, post_row, expert_up_cpu, shared_dim, hidden);
+            for (uint32_t i = 0; i < shared_dim; ++i) {
+                expert_mid_cpu[i] = siluf_local(expert_gate_cpu[i]) * expert_up_cpu[i];
+                if (expert_mid_cpu[i] > QWEN_SWIGLU_CLAMP) expert_mid_cpu[i] = QWEN_SWIGLU_CLAMP;
+                if (expert_mid_cpu[i] < -QWEN_SWIGLU_CLAMP) expert_mid_cpu[i] = -QWEN_SWIGLU_CLAMP;
+            }
+            matvec(cpu_cache->down_shexp_w, expert_mid_cpu, shared_row, hidden, shared_dim);
+        }
+    }
     if (g_full_dbg_active && n_tokens == 1u) {
         memcpy(g_full_dbg_gpu.post_ln, post_cpu, sizeof(g_full_dbg_gpu.post_ln));
         memcpy(g_full_dbg_gpu.router_logits, router_logits_cpu, sizeof(g_full_dbg_gpu.router_logits));
@@ -620,7 +743,41 @@ static int run_gpu_ffn_from_residual_unified(
         }
     }
 
-    if (use_batched) {
+    if (use_routed_moe) {
+        if (ds4_gpu_tensor_write(router_selected, 0, router_selected_cpu, (uint64_t)n_tokens * topk * sizeof(int32_t)) == 0) goto cleanup;
+        if (ds4_gpu_tensor_write(router_weights, 0, router_weights_cpu, (uint64_t)n_tokens * topk * sizeof(float)) == 0) goto cleanup;
+        if (ds4_gpu_begin_commands() == 0) goto cleanup;
+        if (ds4_gpu_routed_moe_batch_tensor(routed_out,
+                                            expert_gate,
+                                            expert_up,
+                                            expert_mid,
+                                            expert_down,
+                                            mf->map,
+                                            mf->size,
+                                            layer->ffn_gate_exps->abs_offset,
+                                            layer->ffn_up_exps->abs_offset,
+                                            layer->ffn_down_exps->abs_offset,
+                                            layer->ffn_gate_exps->type,
+                                            layer->ffn_down_exps->type,
+                                            gate_expert_bytes,
+                                            gate_row_bytes,
+                                            down_expert_bytes,
+                                            down_row_bytes,
+                                            hidden,
+                                            shared_dim,
+                                            hidden,
+                                            router_selected,
+                                            router_weights,
+                                            ROUTER_COUNT,
+                                            topk,
+                                            QWEN_SWIGLU_CLAMP,
+                                            post,
+                                            layer_index,
+                                            n_tokens,
+                                            NULL) == 0) goto cleanup;
+        if (ds4_gpu_end_commands() == 0) goto cleanup;
+        if (ds4_gpu_tensor_read(routed_out, 0, routed_out_cpu, seq_hidden_bytes) == 0) goto cleanup;
+    } else if (use_q8_expert_gpu && use_batched) {
         if (n_union > topk) goto cleanup;
         if (n_union > 0u) {
             if (ds4_gpu_begin_commands() == 0) goto cleanup;
@@ -666,7 +823,7 @@ static int run_gpu_ffn_from_residual_unified(
                 }
             }
         }
-    } else {
+    } else if (use_q8_expert_gpu) {
         for (uint32_t u = 0; u < n_union; ++u) {
             const uint32_t expert_id = union_ids[u];
             if (ds4_gpu_begin_commands() == 0) goto cleanup;
@@ -698,6 +855,81 @@ static int run_gpu_ffn_from_residual_unified(
                 }
             }
         }
+    } else if (use_decoded_expert_gpu) {
+        if (n_union > topk) goto cleanup;
+        for (uint32_t u = 0; u < n_union; ++u) {
+            const uint32_t expert_id = union_ids[u];
+            if (!ensure_full_expert_loaded(gf, layer, cpu_cache, expert_id, ffn_err, sizeof(ffn_err))) goto cleanup;
+        }
+        if (n_union > 0u) {
+            if (ds4_gpu_begin_commands() == 0) goto cleanup;
+        }
+        for (uint32_t u = 0; u < n_union; ++u) {
+            const uint32_t expert_id = union_ids[u];
+            const expert_cache_entry *e = &cpu_cache->experts[expert_id];
+            ds4_gpu_tensor *expert_down_slot = ds4_gpu_tensor_view(
+                expert_down,
+                (uint64_t)u * seq_hidden_bytes,
+                seq_hidden_bytes);
+            if (!expert_down_slot) goto cleanup;
+            if (gpu_host_f32_matmul_tensor(expert_gate, e->gate,
+                                           hidden, shared_dim, post, n_tokens) == 0) goto cleanup;
+            if (gpu_host_f32_matmul_tensor(expert_up, e->up,
+                                           hidden, shared_dim, post, n_tokens) == 0) goto cleanup;
+            if (ds4_gpu_swiglu_tensor(expert_mid, expert_gate, expert_up,
+                                      n_tokens * shared_dim, QWEN_SWIGLU_CLAMP, 1.0f) == 0) goto cleanup;
+            if (gpu_host_f32_matmul_tensor(expert_down_slot, e->down,
+                                           shared_dim, hidden, expert_mid, n_tokens) == 0) goto cleanup;
+            ds4_gpu_tensor_free(expert_down_slot);
+        }
+        if (n_union > 0u) {
+            if (ds4_gpu_end_commands() == 0) goto cleanup;
+        }
+        for (uint32_t u = 0; u < n_union; ++u) {
+            const uint32_t expert_id = union_ids[u];
+            if (ds4_gpu_tensor_read(expert_down, (uint64_t)u * seq_hidden_bytes, expert_down_cpu, seq_hidden_bytes) == 0) goto cleanup;
+            for (uint32_t t = 0; t < n_tokens; ++t) {
+                float weight = 0.0f;
+                for (uint32_t i = 0; i < topk; ++i) {
+                    const size_t base = (size_t)t * topk + i;
+                    if ((uint32_t)router_selected_cpu[base] == expert_id) {
+                        weight = router_weights_cpu[base];
+                        break;
+                    }
+                }
+                if (weight == 0.0f) continue;
+                for (uint32_t d = 0; d < hidden; ++d) {
+                    const size_t idx = (size_t)t * hidden + d;
+                    routed_out_cpu[idx] += expert_down_cpu[idx] * weight;
+                }
+            }
+        }
+    } else {
+        for (uint32_t u = 0; u < n_union; ++u) {
+            const uint32_t expert_id = union_ids[u];
+            if (!ensure_full_expert_loaded(gf, layer, cpu_cache, expert_id, ffn_err, sizeof(ffn_err))) goto cleanup;
+        }
+        for (uint32_t t = 0; t < n_tokens; ++t) {
+            const float *post_row = post_cpu + (size_t)t * hidden;
+            for (uint32_t i = 0; i < topk; ++i) {
+                const size_t route_base = (size_t)t * topk + i;
+                const uint32_t expert_id = router_selected_cpu[route_base];
+                const float weight = router_weights_cpu[route_base];
+                const expert_cache_entry *e = &cpu_cache->experts[expert_id];
+                matvec(e->gate, post_row, expert_gate_cpu, shared_dim, hidden);
+                matvec(e->up, post_row, expert_up_cpu, shared_dim, hidden);
+                for (uint32_t j = 0; j < shared_dim; ++j) {
+                    expert_mid_cpu[j] = siluf_local(expert_gate_cpu[j]) * expert_up_cpu[j];
+                    if (expert_mid_cpu[j] > QWEN_SWIGLU_CLAMP) expert_mid_cpu[j] = QWEN_SWIGLU_CLAMP;
+                    if (expert_mid_cpu[j] < -QWEN_SWIGLU_CLAMP) expert_mid_cpu[j] = -QWEN_SWIGLU_CLAMP;
+                }
+                matvec(e->down, expert_mid_cpu, expert_down_cpu, hidden, shared_dim);
+                for (uint32_t d = 0; d < hidden; ++d) {
+                    const size_t idx = (size_t)t * hidden + d;
+                    routed_out_cpu[idx] += expert_down_cpu[d] * weight;
+                }
+            }
+        }
     }
     if (g_full_dbg_active && n_tokens == 1u) {
         memcpy(g_full_dbg_gpu.routed_out, routed_out_cpu, sizeof(g_full_dbg_gpu.routed_out));
@@ -721,6 +953,9 @@ static int run_gpu_ffn_from_residual_unified(
 
 cleanup:
     if (!use_persistent) {
+        ds4_gpu_tensor_free(router_weights);
+        ds4_gpu_tensor_free(router_selected);
+        ds4_gpu_tensor_free(routed_out);
         ds4_gpu_tensor_free(expert_down);
         ds4_gpu_tensor_free(expert_mid);
         ds4_gpu_tensor_free(expert_up);
@@ -740,11 +975,17 @@ cleanup:
         free(shared_out_cpu);
         free(router_logits_cpu);
     }
+    free(expert_mid_cpu);
+    free(expert_up_cpu);
+    free(expert_gate_cpu);
     return ok;
 }
 
-static int run_full_layer_step_gpu(const qwen36_35a3b_q8_layer *layer,
+static int run_full_layer_step_gpu(const qwen36_gguf_file *gf,
+                                   const qwen36_contract_layer *layer,
+                                   uint32_t full_layer,
                                    const mapped_file *mf,
+                                   full_layer_cache *cpu_cache,
                                    const full_layer_small_cache *cache,
                                    full_layer_state *state,
                                    const float *input_row,
@@ -823,66 +1064,101 @@ static int run_full_layer_step_gpu(const qwen36_35a3b_q8_layer *layer,
     if (ds4_gpu_matmul_q8_0_tensor(v_gpu, mf->map, mf->size,
                                    layer->attn_v->abs_offset, FULL_HIDDEN, FULL_NUM_KV_HEADS * FULL_HEAD_DIM, attn_in_gpu, 1u) == 0) goto cleanup;
     if (ds4_gpu_end_commands() == 0) goto cleanup;
-
     if (ds4_gpu_tensor_read(qg_gpu, 0, qg, (uint64_t)FULL_ATTN_GATE_DIM * 2u * sizeof(float)) == 0) goto cleanup;
-    if (ds4_gpu_tensor_read(k_gpu, 0, kk, (uint64_t)FULL_NUM_KV_HEADS * FULL_HEAD_DIM * sizeof(float)) == 0) goto cleanup;
-    if (ds4_gpu_tensor_read(v_gpu, 0, vv, (uint64_t)FULL_NUM_KV_HEADS * FULL_HEAD_DIM * sizeof(float)) == 0) goto cleanup;
+    for (uint32_t h = 0; h < FULL_NUM_HEADS; ++h) {
+        const float *qg_head = qg + (size_t)h * (FULL_HEAD_DIM * 2u);
+        rmsnorm_weight_raw(qg_head,
+                           q_cur + (size_t)h * FULL_HEAD_DIM,
+                           cache->q_norm_w,
+                           FULL_HEAD_DIM);
+        memcpy(gate_cur + (size_t)h * FULL_HEAD_DIM,
+               qg_head + FULL_HEAD_DIM,
+               (size_t)FULL_HEAD_DIM * sizeof(float));
+    }
+    for (uint32_t h = 0; h < FULL_NUM_HEADS; ++h) {
+        apply_rope_one_inplace(q_cur + (size_t)h * FULL_HEAD_DIM, pos);
+    }
+    if (ds4_gpu_tensor_write(q_cur_gpu, 0, q_cur, (uint64_t)FULL_ATTN_GATE_DIM * sizeof(float)) == 0) goto cleanup;
+    if (ds4_gpu_tensor_write(gate_gpu, 0, gate_cur, (uint64_t)FULL_ATTN_GATE_DIM * sizeof(float)) == 0) goto cleanup;
     if (g_full_dbg_active) {
         if (ds4_gpu_tensor_read(attn_in_gpu, 0, attn_in, (uint64_t)FULL_HIDDEN * sizeof(float)) == 0) goto cleanup;
+        if (ds4_gpu_tensor_read(k_gpu, 0, kk, (uint64_t)FULL_NUM_KV_HEADS * FULL_HEAD_DIM * sizeof(float)) == 0) goto cleanup;
+        if (ds4_gpu_tensor_read(v_gpu, 0, vv, (uint64_t)FULL_NUM_KV_HEADS * FULL_HEAD_DIM * sizeof(float)) == 0) goto cleanup;
         memcpy(g_full_dbg_gpu.attn_in, attn_in, sizeof(g_full_dbg_gpu.attn_in));
         memcpy(g_full_dbg_gpu.qg, qg, sizeof(g_full_dbg_gpu.qg));
         memcpy(g_full_dbg_gpu.kk, kk, sizeof(g_full_dbg_gpu.kk));
         memcpy(g_full_dbg_gpu.vv, vv, sizeof(g_full_dbg_gpu.vv));
     }
 
-    for (uint32_t h = 0; h < FULL_NUM_HEADS; ++h) {
-        const float *src = qg + (size_t)h * (FULL_HEAD_DIM * 2u);
-        float *qdst = q_cur + (size_t)h * FULL_HEAD_DIM;
-        rmsnorm_weight_raw(src, qdst, cache->q_norm_w, FULL_HEAD_DIM);
-        memcpy(gate_cur + (size_t)h * FULL_HEAD_DIM, src + FULL_HEAD_DIM, FULL_HEAD_DIM * sizeof(float));
-    }
-    for (uint32_t h = 0; h < FULL_NUM_KV_HEADS; ++h) {
-        rmsnorm_weight_raw(kk + (size_t)h * FULL_HEAD_DIM, k_cur + (size_t)h * FULL_HEAD_DIM, cache->k_norm_w, FULL_HEAD_DIM);
-        memcpy(v_cur + (size_t)h * FULL_HEAD_DIM, vv + (size_t)h * FULL_HEAD_DIM, FULL_HEAD_DIM * sizeof(float));
-    }
-    for (uint32_t h = 0; h < FULL_NUM_KV_HEADS; ++h) apply_rope_one_inplace(k_cur + (size_t)h * FULL_HEAD_DIM, pos);
-    for (uint32_t h = 0; h < FULL_NUM_HEADS; ++h) apply_rope_one_inplace(q_cur + (size_t)h * FULL_HEAD_DIM, pos);
-    if (g_full_dbg_active) {
-        memcpy(g_full_dbg_gpu.q_cur, q_cur, sizeof(g_full_dbg_gpu.q_cur));
-        memcpy(g_full_dbg_gpu.k_cur, k_cur, sizeof(g_full_dbg_gpu.k_cur));
-        memcpy(g_full_dbg_gpu.v_cur, v_cur, sizeof(g_full_dbg_gpu.v_cur));
-    }
-
     if (!ensure_full_layer_state_cap(state, pos + 1u, NULL, 0)) goto cleanup;
-    memcpy(state->k_all + (size_t)pos * FULL_NUM_KV_HEADS * FULL_HEAD_DIM, k_cur, sizeof(k_cur));
-    memcpy(state->v_all + (size_t)pos * FULL_NUM_KV_HEADS * FULL_HEAD_DIM, v_cur, sizeof(v_cur));
 
     memset(attn_out_flat, 0, sizeof(attn_out_flat));
-    if (gpu_decode_attn) {
+    {
         const uint64_t kv_row_bytes =
             (uint64_t)FULL_NUM_KV_HEADS * FULL_HEAD_DIM * sizeof(float);
         const uint64_t kv_row_offset = (uint64_t)pos * kv_row_bytes;
-        if (ds4_gpu_tensor_write(q_cur_gpu, 0, q_cur, (uint64_t)FULL_ATTN_GATE_DIM * sizeof(float)) == 0) goto cleanup;
-        if (ds4_gpu_tensor_write(gate_gpu, 0, gate_cur, (uint64_t)FULL_ATTN_GATE_DIM * sizeof(float)) == 0) goto cleanup;
-        if (ds4_gpu_tensor_write(state->attn_k_cache_gpu, kv_row_offset, k_cur, kv_row_bytes) == 0) goto cleanup;
-        if (ds4_gpu_tensor_write(state->attn_v_cache_gpu, kv_row_offset, v_cur, kv_row_bytes) == 0) goto cleanup;
         if (ds4_gpu_begin_commands() == 0) goto cleanup;
-        if (ds4_gpu_attention_decode_qwen_gqa_tensor(heads_gpu,
-                                                     q_cur_gpu,
-                                                     state->attn_k_cache_gpu,
-                                                     state->attn_v_cache_gpu,
-                                                     pos + 1u,
-                                                     FULL_NUM_HEADS,
-                                                     FULL_NUM_KV_HEADS,
-                                                     FULL_HEAD_DIM) == 0) goto cleanup;
-        if (ds4_gpu_sigmoid_mul_tensor(heads_gpu, heads_gpu, gate_gpu, FULL_ATTN_GATE_DIM) == 0) goto cleanup;
-        if (ds4_gpu_matmul_q8_0_tensor(proj_out_gpu, mf->map, mf->size,
-                                       layer->attn_output->abs_offset, FULL_ATTN_GATE_DIM, FULL_HIDDEN, heads_gpu, 1u) == 0) goto cleanup;
+        if (ds4_gpu_rms_norm_weight_rows_tensor(k_gpu, k_gpu, mf->map, mf->size,
+                                                layer->attn_k_norm->abs_offset,
+                                                FULL_HEAD_DIM, FULL_NUM_KV_HEADS, QWEN_RMS_EPS) == 0) goto cleanup;
+        if (ds4_gpu_rope_tail_split_half_tensor(k_gpu,
+                                                1u,
+                                                FULL_NUM_KV_HEADS,
+                                                FULL_HEAD_DIM,
+                                                FULL_ROTARY_DIM,
+                                                pos,
+                                                0u,
+                                                false,
+                                                10000000.0f,
+                                                1.0f,
+                                                0.0f,
+                                                1.0f,
+                                                0.0f,
+                                                0.0f) == 0) goto cleanup;
+        if (ds4_gpu_tensor_copy(state->attn_k_cache_gpu, kv_row_offset, k_gpu, 0, kv_row_bytes) == 0) goto cleanup;
+        if (ds4_gpu_tensor_copy(state->attn_v_cache_gpu, kv_row_offset, v_gpu, 0, kv_row_bytes) == 0) goto cleanup;
+        if (gpu_decode_attn) {
+            if (ds4_gpu_attention_decode_qwen_gqa_tensor(heads_gpu,
+                                                         q_cur_gpu,
+                                                         state->attn_k_cache_gpu,
+                                                         state->attn_v_cache_gpu,
+                                                         pos + 1u,
+                                                         FULL_NUM_HEADS,
+                                                         FULL_NUM_KV_HEADS,
+                                                         FULL_HEAD_DIM) == 0) goto cleanup;
+            if (ds4_gpu_sigmoid_mul_tensor(heads_gpu, heads_gpu, gate_gpu, FULL_ATTN_GATE_DIM) == 0) goto cleanup;
+            if (ds4_gpu_matmul_q8_0_tensor(proj_out_gpu, mf->map, mf->size,
+                                           layer->attn_output->abs_offset, FULL_ATTN_GATE_DIM, FULL_HIDDEN, heads_gpu, 1u) == 0) goto cleanup;
+        }
         if (ds4_gpu_end_commands() == 0) goto cleanup;
+    }
+
+    if (gpu_decode_attn) {
+        if (ds4_gpu_tensor_read(k_gpu, 0, k_cur, (uint64_t)FULL_NUM_KV_HEADS * FULL_HEAD_DIM * sizeof(float)) == 0) goto cleanup;
+        if (ds4_gpu_tensor_read(v_gpu, 0, v_cur, (uint64_t)FULL_NUM_KV_HEADS * FULL_HEAD_DIM * sizeof(float)) == 0) goto cleanup;
         if (g_full_dbg_active) {
+            if (ds4_gpu_tensor_read(q_cur_gpu, 0, q_cur, (uint64_t)FULL_ATTN_GATE_DIM * sizeof(float)) == 0) goto cleanup;
             if (ds4_gpu_tensor_read(heads_gpu, 0, attn_out_flat, (uint64_t)FULL_ATTN_GATE_DIM * sizeof(float)) == 0) goto cleanup;
         }
+        memcpy(state->k_all + (size_t)pos * FULL_NUM_KV_HEADS * FULL_HEAD_DIM, k_cur, sizeof(k_cur));
+        memcpy(state->v_all + (size_t)pos * FULL_NUM_KV_HEADS * FULL_HEAD_DIM, v_cur, sizeof(v_cur));
+        if (g_full_dbg_active) {
+            memcpy(g_full_dbg_gpu.q_cur, q_cur, sizeof(g_full_dbg_gpu.q_cur));
+            memcpy(g_full_dbg_gpu.k_cur, k_cur, sizeof(g_full_dbg_gpu.k_cur));
+            memcpy(g_full_dbg_gpu.v_cur, v_cur, sizeof(g_full_dbg_gpu.v_cur));
+        }
     } else {
+        if (ds4_gpu_tensor_read(q_cur_gpu, 0, q_cur, (uint64_t)FULL_ATTN_GATE_DIM * sizeof(float)) == 0) goto cleanup;
+        if (ds4_gpu_tensor_read(gate_gpu, 0, gate_cur, (uint64_t)FULL_ATTN_GATE_DIM * sizeof(float)) == 0) goto cleanup;
+        if (ds4_gpu_tensor_read(k_gpu, 0, k_cur, (uint64_t)FULL_NUM_KV_HEADS * FULL_HEAD_DIM * sizeof(float)) == 0) goto cleanup;
+        if (ds4_gpu_tensor_read(v_gpu, 0, v_cur, (uint64_t)FULL_NUM_KV_HEADS * FULL_HEAD_DIM * sizeof(float)) == 0) goto cleanup;
+        memcpy(state->k_all + (size_t)pos * FULL_NUM_KV_HEADS * FULL_HEAD_DIM, k_cur, sizeof(k_cur));
+        memcpy(state->v_all + (size_t)pos * FULL_NUM_KV_HEADS * FULL_HEAD_DIM, v_cur, sizeof(v_cur));
+        if (g_full_dbg_active) {
+            memcpy(g_full_dbg_gpu.q_cur, q_cur, sizeof(g_full_dbg_gpu.q_cur));
+            memcpy(g_full_dbg_gpu.k_cur, k_cur, sizeof(g_full_dbg_gpu.k_cur));
+            memcpy(g_full_dbg_gpu.v_cur, v_cur, sizeof(g_full_dbg_gpu.v_cur));
+        }
         for (uint32_t h = 0; h < FULL_NUM_HEADS; ++h) {
             const uint32_t kvh = h / (FULL_NUM_HEADS / FULL_NUM_KV_HEADS);
             float *out = attn_out_flat + (size_t)h * FULL_HEAD_DIM;
@@ -921,7 +1197,7 @@ static int run_full_layer_step_gpu(const qwen36_35a3b_q8_layer *layer,
 
     for (uint32_t d = 0; d < FULL_HIDDEN; ++d) residual[d] = input_row[d] + proj_out[d];
     if (g_full_dbg_active) memcpy(g_full_dbg_gpu.residual, residual, sizeof(g_full_dbg_gpu.residual));
-    if (!run_gpu_ffn_from_residual_unified(mf, layer, cache->shared_gate_inp_w, state, 1u, residual, out_row, NULL)) goto cleanup;
+    if (!run_gpu_ffn_from_residual_unified(gf, mf, layer, full_layer, cpu_cache, cache->shared_gate_inp_w, state, 1u, residual, out_row, NULL)) goto cleanup;
 
     memcpy(state->output_seq + (size_t)pos * FULL_HIDDEN, out_row, (size_t)FULL_HIDDEN * sizeof(float));
     state->seq_len = pos + 1u;
@@ -948,25 +1224,31 @@ cleanup:
 }
 
 static int run_full_layer_prefill_gpu(uint32_t full_layer,
-                                      const qwen36_35a3b_q8_layer *layer,
+                                      const qwen36_gguf_file *gf,
+                                      const qwen36_contract_layer *layer,
                                       const mapped_file *mf,
+                                      full_layer_cache *cpu_cache,
                                       const full_layer_small_cache *cache,
                                       full_layer_state *state,
                                       const float *input_seq,
                                       uint32_t seq_len) {
     float row_out[FULL_HIDDEN];
-    (void)full_layer;
     free_full_layer_state(state);
     memset(state, 0, sizeof(*state));
+    g_qwen36_full_gpu_prefill_mode = 1;
     for (uint32_t t = 0; t < seq_len; ++t) {
-        if (!run_full_layer_step_gpu(layer, mf, cache, state, input_seq + (size_t)t * FULL_HIDDEN, row_out)) return 0;
+        if (!run_full_layer_step_gpu(gf, layer, full_layer, mf, cpu_cache, cache, state, input_seq + (size_t)t * FULL_HIDDEN, row_out)) {
+            g_qwen36_full_gpu_prefill_mode = 0;
+            return 0;
+        }
     }
+    g_qwen36_full_gpu_prefill_mode = 0;
     return 1;
 }
 
 static int run_hybrid_layer_prefill_gpuproj(const live_fixture *fx,
                                             const qwen36_gguf_file *gf,
-                                            const qwen36_35a3b_q8_layer *layer,
+                                            const qwen36_contract_layer *layer,
                                             const mapped_file *mf,
                                             layer_runtime *ls,
                                             uint32_t seq_len,

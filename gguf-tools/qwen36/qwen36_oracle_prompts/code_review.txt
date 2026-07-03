@@ -1,0 +1,2 @@
+Code review note:
+The highest-risk implementation area in a narrow hybrid-MoE C runtime is

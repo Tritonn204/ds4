@@ -1,3 +1,4 @@
+#include "qwen36_35a3b_q4xl.h"
 #include "qwen36_35a3b_q8.h"
 
 #include <errno.h>
@@ -109,6 +110,9 @@ typedef struct full_layer_state {
     ds4_gpu_tensor *ffn_expert_up_gpu;
     ds4_gpu_tensor *ffn_expert_mid_gpu;
     ds4_gpu_tensor *ffn_expert_down_gpu;
+    ds4_gpu_tensor *ffn_routed_out_gpu;
+    ds4_gpu_tensor *ffn_router_selected_gpu;
+    ds4_gpu_tensor *ffn_router_weights_gpu;
 } full_layer_state;
 
 typedef struct full_layer_dbg_scratch {
@@ -134,6 +138,119 @@ typedef struct full_layer_dbg_scratch {
     float routed_out[FULL_HIDDEN];
     float final_out[FULL_HIDDEN];
 } full_layer_dbg_scratch;
+
+#define QK_K 256
+#define K_SCALE_SIZE 12
+
+typedef struct {
+    uint16_t d;
+    uint16_t dmin;
+    uint8_t scales[K_SCALE_SIZE];
+    uint8_t qs[QK_K / 2];
+} qwen36_block_q4_K;
+
+typedef struct {
+    uint16_t d;
+    uint16_t dmin;
+    uint8_t scales[K_SCALE_SIZE];
+    uint8_t qh[QK_K / 8];
+    uint8_t qs[QK_K / 2];
+} qwen36_block_q5_K;
+
+typedef struct {
+    uint8_t ql[QK_K / 2];
+    uint8_t qh[QK_K / 4];
+    int8_t  scales[QK_K / 16];
+    uint16_t d;
+} qwen36_block_q6_K;
+
+typedef struct qwen36_contract_layer {
+    int kind;
+    const qwen36_gguf_tensor *attn_norm;
+    const qwen36_gguf_tensor *post_attn_norm;
+    const qwen36_gguf_tensor *attn_gate;
+    const qwen36_gguf_tensor *attn_qkv;
+    const qwen36_gguf_tensor *attn_q;
+    const qwen36_gguf_tensor *attn_q_norm;
+    const qwen36_gguf_tensor *attn_k;
+    const qwen36_gguf_tensor *attn_k_norm;
+    const qwen36_gguf_tensor *attn_v;
+    const qwen36_gguf_tensor *attn_output;
+    const qwen36_gguf_tensor *ssm_a;
+    const qwen36_gguf_tensor *ssm_alpha;
+    const qwen36_gguf_tensor *ssm_beta;
+    const qwen36_gguf_tensor *ssm_conv1d;
+    const qwen36_gguf_tensor *ssm_dt_bias;
+    const qwen36_gguf_tensor *ssm_norm;
+    const qwen36_gguf_tensor *ssm_out;
+    const qwen36_gguf_tensor *ffn_gate_inp;
+    const qwen36_gguf_tensor *ffn_gate_inp_shexp;
+    const qwen36_gguf_tensor *ffn_gate_exps;
+    const qwen36_gguf_tensor *ffn_up_exps;
+    const qwen36_gguf_tensor *ffn_down_exps;
+    const qwen36_gguf_tensor *ffn_gate_shexp;
+    const qwen36_gguf_tensor *ffn_up_shexp;
+    const qwen36_gguf_tensor *ffn_down_shexp;
+} qwen36_contract_layer;
+
+#define QWEN36_CONTRACT_LAYER_KIND_HYBRID_SSM 1
+#define QWEN36_CONTRACT_LAYER_KIND_FULL_ATTENTION 2
+
+typedef struct qwen36_contract_model {
+    const qwen36_gguf_file *gf;
+    const qwen36_gguf_tensor *token_embd;
+    const qwen36_gguf_tensor *output_norm;
+    const qwen36_gguf_tensor *output;
+    qwen36_contract_layer layers[QWEN36_35A3B_Q8_BLOCK_COUNT];
+    uint32_t hybrid_layer_count;
+    uint32_t full_attn_layer_count;
+} qwen36_contract_model;
+
+static void q4_k_get_scale_min(int j, const uint8_t *q, uint8_t *sc, uint8_t *m) {
+    if (j < 4) {
+        *sc = q[j] & 63;
+        *m = q[j + 4] & 63;
+    } else {
+        *sc = (q[j + 4] & 0xF) | ((q[j - 4] >> 6) << 4);
+        *m = (q[j + 4] >> 4) | ((q[j - 0] >> 6) << 4);
+    }
+}
+
+static void map_q8_contract_layer(qwen36_contract_layer *dst, const qwen36_35a3b_q8_layer *src) {
+    memcpy(dst, src, sizeof(*dst));
+}
+
+static void map_q4xl_contract_layer(qwen36_contract_layer *dst, const qwen36_35a3b_q4xl_layer *src) {
+    memcpy(dst, src, sizeof(*dst));
+}
+
+static int bind_contract_model(const qwen36_gguf_file *gf, qwen36_contract_model *out, char *err, size_t err_cap) {
+    qwen36_35a3b_q8_model q8;
+    qwen36_35a3b_q4xl_model q4;
+    uint32_t i;
+    memset(out, 0, sizeof(*out));
+    if (qwen36_35a3b_q8_bind(gf, &q8, err, err_cap)) {
+        out->gf = q8.gf;
+        out->token_embd = q8.token_embd;
+        out->output_norm = q8.output_norm;
+        out->output = q8.output;
+        out->hybrid_layer_count = q8.hybrid_layer_count;
+        out->full_attn_layer_count = q8.full_attn_layer_count;
+        for (i = 0; i < QWEN36_35A3B_Q8_BLOCK_COUNT; ++i) map_q8_contract_layer(&out->layers[i], &q8.layers[i]);
+        return 1;
+    }
+    if (qwen36_35a3b_q4xl_bind(gf, &q4, err, err_cap)) {
+        out->gf = q4.gf;
+        out->token_embd = q4.token_embd;
+        out->output_norm = q4.output_norm;
+        out->output = q4.output;
+        out->hybrid_layer_count = q4.hybrid_layer_count;
+        out->full_attn_layer_count = q4.full_attn_layer_count;
+        for (i = 0; i < QWEN36_35A3B_Q4XL_BLOCK_COUNT; ++i) map_q4xl_contract_layer(&out->layers[i], &q4.layers[i]);
+        return 1;
+    }
+    return 0;
+}
 
 typedef struct layer_step_scratch {
     float *input_ln;
@@ -187,6 +304,9 @@ typedef struct layer_step_scratch {
     ds4_gpu_tensor *expert_up_gpu;
     ds4_gpu_tensor *expert_mid_gpu;
     ds4_gpu_tensor *expert_down_gpu;
+    ds4_gpu_tensor *routed_out_gpu;
+    ds4_gpu_tensor *router_selected_gpu;
+    ds4_gpu_tensor *router_weights_gpu;
     ds4_gpu_tensor *q_gpu;
     ds4_gpu_tensor *k_gpu;
     ds4_gpu_tensor *v_gpu;
@@ -212,7 +332,23 @@ static void apply_rope_one_inplace(float *x, uint32_t pos);
 static void matvec(const float *mat, const float *vec, float *out, uint32_t rows, uint32_t cols);
 static void topk_softmax256(const float *logits, uint32_t k, uint32_t *idx, float *scores);
 static int decode_q8_rows(const qwen36_gguf_file *gf, const qwen36_gguf_tensor *t, uint32_t row_idx, uint32_t nrows, uint32_t row_elems, float *out, char *err, size_t err_cap);
-static int ensure_expert_loaded(const qwen36_gguf_file *gf, const qwen36_35a3b_q8_layer *layer, expert_cache_entry *cache, uint32_t expert_id, uint32_t hidden, uint32_t inter, char *err, size_t err_cap);
+static int ensure_expert_loaded(const qwen36_gguf_file *gf, const qwen36_contract_layer *layer, expert_cache_entry *cache, uint32_t expert_id, uint32_t hidden, uint32_t inter, char *err, size_t err_cap);
+static int ensure_full_expert_loaded(const qwen36_gguf_file *gf, const qwen36_contract_layer *layer, full_layer_cache *cache, uint32_t expert_id, char *err, size_t err_cap);
+static int ensure_full_layer_loaded(const qwen36_gguf_file *gf, const qwen36_contract_layer *layer, full_layer_cache *cache, char *err, size_t err_cap);
+static int hybrid_gpu_dense_matmul_tensor(ds4_gpu_tensor *out,
+                                          const mapped_file *mf,
+                                          const qwen36_gguf_tensor *weight,
+                                          uint64_t in_dim,
+                                          uint64_t out_dim,
+                                          const ds4_gpu_tensor *x,
+                                          uint64_t n_tok);
+static int gpu_decoded_expert_type_supported(uint32_t type);
+static int gpu_host_f32_matmul_tensor(ds4_gpu_tensor *out,
+                                      const float *weight,
+                                      uint64_t in_dim,
+                                      uint64_t out_dim,
+                                      const ds4_gpu_tensor *x,
+                                      uint64_t n_tok);
 static void run_deltanet_head_step(float *state,
                                    uint32_t head_k_dim,
                                    uint32_t head_v_dim,
@@ -227,7 +363,7 @@ static void run_deltanet_head_step(float *state,
                                    float *out_row);
 static int run_hybrid_layer_step_gpuproj(const live_fixture *fx,
                                          const qwen36_gguf_file *gf,
-                                         const qwen36_35a3b_q8_layer *layer,
+                                         const qwen36_contract_layer *layer,
                                          const mapped_file *mf,
                                          layer_runtime *ls,
                                          const float *layer_input,
@@ -236,7 +372,7 @@ static int run_hybrid_layer_step_gpuproj(const live_fixture *fx,
                                          size_t err_cap);
 static int run_step_layer_dynamic(const live_fixture *fx,
                                   const qwen36_gguf_file *gf,
-                                  const qwen36_35a3b_q8_layer *layer,
+                                  const qwen36_contract_layer *layer,
                                   layer_runtime *ls,
                                   const float *layer_input,
                                   float *out_row,
@@ -277,7 +413,7 @@ typedef struct layer_runtime {
 struct unified_session_state {
     worker_config cfg;
     qwen36_gguf_file gf;
-    qwen36_35a3b_q8_model model;
+    qwen36_contract_model model;
     live_fixture *fxs;
     layer_runtime *layers;
     uint32_t n_fx;
@@ -300,6 +436,8 @@ struct unified_session_state {
     float *owned_seq;
     float **cycle_pre_full_seqs;
     float **cycle_owned_seqs;
+    float **cycle_pre_full_rows;
+    float **cycle_owned_rows;
     int prefilled;
 };
 
@@ -502,6 +640,9 @@ static void free_full_layer_state(full_layer_state *st) {
     ds4_gpu_tensor_free(st->ffn_expert_up_gpu);
     ds4_gpu_tensor_free(st->ffn_expert_mid_gpu);
     ds4_gpu_tensor_free(st->ffn_expert_down_gpu);
+    ds4_gpu_tensor_free(st->ffn_routed_out_gpu);
+    ds4_gpu_tensor_free(st->ffn_router_selected_gpu);
+    ds4_gpu_tensor_free(st->ffn_router_weights_gpu);
     memset(st, 0, sizeof(*st));
 }
 
@@ -594,6 +735,9 @@ static int ensure_full_layer_decode_scratch(full_layer_state *st, char *err, siz
     if (!st->ffn_expert_up_gpu) st->ffn_expert_up_gpu = ds4_gpu_tensor_alloc(shared_bytes);
     if (!st->ffn_expert_mid_gpu) st->ffn_expert_mid_gpu = ds4_gpu_tensor_alloc(shared_bytes);
     if (!st->ffn_expert_down_gpu) st->ffn_expert_down_gpu = ds4_gpu_tensor_alloc(topk * hidden_bytes);
+    if (!st->ffn_routed_out_gpu) st->ffn_routed_out_gpu = ds4_gpu_tensor_alloc(hidden_bytes);
+    if (!st->ffn_router_selected_gpu) st->ffn_router_selected_gpu = ds4_gpu_tensor_alloc(topk * sizeof(int32_t));
+    if (!st->ffn_router_weights_gpu) st->ffn_router_weights_gpu = ds4_gpu_tensor_alloc(topk * sizeof(float));
 
     if (!st->step_attn_in || !st->step_qg || !st->step_kk || !st->step_vv ||
         !st->ffn_router_logits_cpu || !st->ffn_shared_out_cpu || !st->ffn_expert_down_cpu ||
@@ -604,7 +748,8 @@ static int ensure_full_layer_decode_scratch(full_layer_state *st, char *err, siz
         !st->ffn_residual_gpu || !st->ffn_post_gpu ||
         !st->ffn_router_logits_gpu || !st->ffn_shared_gate_gpu || !st->ffn_shared_up_gpu ||
         !st->ffn_shared_mid_gpu || !st->ffn_shared_out_gpu || !st->ffn_expert_gate_gpu ||
-        !st->ffn_expert_up_gpu || !st->ffn_expert_mid_gpu || !st->ffn_expert_down_gpu) {
+        !st->ffn_expert_up_gpu || !st->ffn_expert_mid_gpu || !st->ffn_expert_down_gpu ||
+        !st->ffn_routed_out_gpu || !st->ffn_router_selected_gpu || !st->ffn_router_weights_gpu) {
         if (err && err_cap) snprintf(err, err_cap, "oom full layer decode scratch");
         return 0;
     }
@@ -815,9 +960,27 @@ static void run_deltanet_head_step(float *state,
 }
 
 static int decode_q8_rows(const qwen36_gguf_file *gf, const qwen36_gguf_tensor *t, uint32_t row_idx, uint32_t nrows, uint32_t row_elems, float *out, char *err, size_t err_cap) {
-    const size_t row_size = 34u * (row_elems / 32u);
-    uint8_t *buf = (uint8_t *)malloc((size_t)nrows * row_size);
-    uint32_t r, j, k;
+    size_t row_size = 0;
+    uint8_t *buf = NULL;
+    uint32_t r;
+    switch (t->type) {
+    case QWEN36_GGUF_TYPE_Q8_0:
+        row_size = 34u * (row_elems / 32u);
+        break;
+    case QWEN36_GGUF_TYPE_Q4_K:
+        row_size = sizeof(qwen36_block_q4_K) * (row_elems / QK_K);
+        break;
+    case QWEN36_GGUF_TYPE_Q5_K:
+        row_size = sizeof(qwen36_block_q5_K) * (row_elems / QK_K);
+        break;
+    case QWEN36_GGUF_TYPE_Q6_K:
+        row_size = sizeof(qwen36_block_q6_K) * (row_elems / QK_K);
+        break;
+    default:
+        snprintf(err, err_cap, "unsupported tensor type for row decode: %s", qwen36_gguf_type_name(t->type));
+        return 0;
+    }
+    buf = (uint8_t *)malloc((size_t)nrows * row_size);
     if (!buf) return 0;
     if (!qwen36_gguf_read_tensor_bytes(gf, t, (uint64_t)row_idx * row_size, buf, (size_t)nrows * row_size, err, err_cap)) {
         free(buf);
@@ -826,11 +989,89 @@ static int decode_q8_rows(const qwen36_gguf_file *gf, const qwen36_gguf_tensor *
     for (r = 0; r < nrows; ++r) {
         const uint8_t *row = buf + (size_t)r * row_size;
         float *dst = out + (size_t)r * row_elems;
-        for (j = 0; j < row_elems / 32u; ++j) {
-            const uint8_t *block = row + j * 34u;
-            const float dscale = f16_to_f32((uint16_t)(block[0] | (block[1] << 8)));
-            const int8_t *qs = (const int8_t *)(block + 2);
-            for (k = 0; k < 32u; ++k) dst[j * 32u + k] = dscale * (float)qs[k];
+        if (t->type == QWEN36_GGUF_TYPE_Q8_0) {
+            for (uint32_t j = 0; j < row_elems / 32u; ++j) {
+                const uint8_t *block = row + j * 34u;
+                const float dscale = f16_to_f32((uint16_t)(block[0] | (block[1] << 8)));
+                const int8_t *qs = (const int8_t *)(block + 2);
+                for (uint32_t k = 0; k < 32u; ++k) dst[j * 32u + k] = dscale * (float)qs[k];
+            }
+        } else if (t->type == QWEN36_GGUF_TYPE_Q4_K) {
+            const qwen36_block_q4_K *blocks = (const qwen36_block_q4_K *)row;
+            const uint32_t nb = row_elems / QK_K;
+            for (uint32_t b = 0; b < nb; ++b) {
+                float *bout = dst + (size_t)b * QK_K;
+                const qwen36_block_q4_K *blk = &blocks[b];
+                const float d = f16_to_f32(blk->d);
+                const float dmin = f16_to_f32(blk->dmin);
+                for (uint32_t g = 0; g < QK_K / 32u; ++g) {
+                    uint8_t sc, m;
+                    q4_k_get_scale_min((int)g, blk->scales, &sc, &m);
+                    {
+                        const float dl = d * (float)sc;
+                        const float dm = dmin * (float)m;
+                        const uint32_t byte_off = (g >> 1) * 32u;
+                        const uint32_t shift = (g & 1u) * 4u;
+                        for (uint32_t i = 0; i < 32u; ++i) {
+                            const uint8_t qv = shift ? (blk->qs[byte_off + i] >> 4) : (blk->qs[byte_off + i] & 0x0Fu);
+                            bout[g * 32u + i] = dl * (float)qv - dm;
+                        }
+                    }
+                }
+            }
+        } else if (t->type == QWEN36_GGUF_TYPE_Q5_K) {
+            const qwen36_block_q5_K *blocks = (const qwen36_block_q5_K *)row;
+            const uint32_t nb = row_elems / QK_K;
+            for (uint32_t b = 0; b < nb; ++b) {
+                float *bout = dst + (size_t)b * QK_K;
+                const qwen36_block_q5_K *blk = &blocks[b];
+                const float d = f16_to_f32(blk->d);
+                const float dmin = f16_to_f32(blk->dmin);
+                uint8_t vals[QK_K];
+                uint8_t m1 = 1, m2 = 2;
+                for (uint32_t seg = 0; seg < 4; ++seg) {
+                    for (uint32_t i = 0; i < 32u; ++i) {
+                        const uint8_t q = blk->qs[seg * 32u + i];
+                        vals[seg * 64u + i] = (q & 0x0Fu) + ((blk->qh[i] & m1) ? 16u : 0u);
+                        vals[seg * 64u + 32u + i] = (q >> 4) + ((blk->qh[i] & m2) ? 16u : 0u);
+                    }
+                    m1 <<= 2;
+                    m2 <<= 2;
+                }
+                for (uint32_t g = 0; g < QK_K / 32u; ++g) {
+                    uint8_t sc, m;
+                    q4_k_get_scale_min((int)g, blk->scales, &sc, &m);
+                    {
+                        const float dl = d * (float)sc;
+                        const float dm = dmin * (float)m;
+                        for (uint32_t i = 0; i < 32u; ++i) bout[g * 32u + i] = dl * (float)vals[g * 32u + i] - dm;
+                    }
+                }
+            }
+        } else if (t->type == QWEN36_GGUF_TYPE_Q6_K) {
+            const qwen36_block_q6_K *blocks = (const qwen36_block_q6_K *)row;
+            const uint32_t nb = row_elems / QK_K;
+            for (uint32_t b = 0; b < nb; ++b) {
+                float *bout = dst + (size_t)b * QK_K;
+                const qwen36_block_q6_K *blk = &blocks[b];
+                const float d = f16_to_f32(blk->d);
+                uint8_t vals[QK_K];
+                for (uint32_t seg = 0; seg < 2; ++seg) {
+                    const uint8_t *ql = blk->ql + seg * 64u;
+                    const uint8_t *qh = blk->qh + seg * 32u;
+                    const uint32_t base = seg * 128u;
+                    for (uint32_t i = 0; i < 32u; ++i) {
+                        vals[base + i] = (ql[i] & 0x0Fu) | ((qh[i] & 0x03u) << 4);
+                        vals[base + 32u + i] = (ql[32u + i] & 0x0Fu) | (((qh[i] >> 2) & 0x03u) << 4);
+                        vals[base + 64u + i] = ((ql[i] >> 4) & 0x0Fu) | (((qh[i] >> 4) & 0x03u) << 4);
+                        vals[base + 96u + i] = ((ql[32u + i] >> 4) & 0x0Fu) | (((qh[i] >> 6) & 0x03u) << 4);
+                    }
+                }
+                for (uint32_t g = 0; g < QK_K / 16u; ++g) {
+                    const float dl = d * (float)blk->scales[g];
+                    for (uint32_t i = 0; i < 16u; ++i) bout[g * 16u + i] = dl * ((float)vals[g * 16u + i] - 32.0f);
+                }
+            }
         }
     }
     free(buf);
@@ -839,6 +1080,110 @@ static int decode_q8_rows(const qwen36_gguf_file *gf, const qwen36_gguf_tensor *
 
 static int decode_q8_row(const qwen36_gguf_file *gf, const qwen36_gguf_tensor *t, uint32_t row_idx, uint32_t hidden, float *out, char *err, size_t err_cap) {
     return decode_q8_rows(gf, t, row_idx, 1u, hidden, out, err, err_cap);
+}
+
+static uint64_t tensor_row_bytes(const qwen36_gguf_tensor *t, uint32_t cols) {
+    switch (t->type) {
+    case QWEN36_GGUF_TYPE_Q8_0:
+        return (uint64_t)(cols / 32u) * 34u;
+    case QWEN36_GGUF_TYPE_Q2_K:
+        return (uint64_t)(cols / QK_K) * 84u;
+    case QWEN36_GGUF_TYPE_Q4_K:
+        return (uint64_t)(cols / QK_K) * sizeof(qwen36_block_q4_K);
+    case QWEN36_GGUF_TYPE_Q5_K:
+        return (uint64_t)(cols / QK_K) * sizeof(qwen36_block_q5_K);
+    case QWEN36_GGUF_TYPE_Q6_K:
+        return (uint64_t)(cols / QK_K) * sizeof(qwen36_block_q6_K);
+    default:
+        return 0;
+    }
+}
+
+static int env_enabled_default_on(const char *name) {
+    const char *env = getenv(name);
+    if (!env || !env[0]) return 1;
+    return !(strcmp(env, "0") == 0 ||
+             strcmp(env, "false") == 0 ||
+             strcmp(env, "FALSE") == 0 ||
+             strcmp(env, "no") == 0 ||
+             strcmp(env, "NO") == 0);
+}
+
+static int hybrid_gpu_routed_supported_types(const qwen36_contract_layer *layer) {
+    return layer->ffn_gate_exps->type == QWEN36_GGUF_TYPE_Q8_0 &&
+           layer->ffn_up_exps->type == QWEN36_GGUF_TYPE_Q8_0 &&
+           layer->ffn_down_exps->type == QWEN36_GGUF_TYPE_Q8_0;
+}
+
+static int hybrid_qwen36_routed_moe_supported_types(uint32_t gate_type, uint32_t down_type) {
+    return (gate_type == QWEN36_GGUF_TYPE_Q4_K && down_type == QWEN36_GGUF_TYPE_Q4_K) ||
+           (gate_type == QWEN36_GGUF_TYPE_IQ2_XXS && down_type == QWEN36_GGUF_TYPE_Q2_K) ||
+           (gate_type == QWEN36_GGUF_TYPE_Q2_K && down_type == QWEN36_GGUF_TYPE_Q2_K);
+}
+
+static int hybrid_gpu_routed_moe_supported_types(const qwen36_contract_layer *layer) {
+    return layer->ffn_gate_exps &&
+           layer->ffn_up_exps &&
+           layer->ffn_down_exps &&
+           layer->ffn_gate_exps->type == layer->ffn_up_exps->type &&
+           hybrid_qwen36_routed_moe_supported_types(layer->ffn_gate_exps->type,
+                                                    layer->ffn_down_exps->type);
+}
+
+static int gpu_decoded_expert_type_supported(uint32_t type) {
+    return type == QWEN36_GGUF_TYPE_Q8_0 ||
+           type == QWEN36_GGUF_TYPE_Q4_K ||
+           type == QWEN36_GGUF_TYPE_Q5_K ||
+           type == QWEN36_GGUF_TYPE_Q6_K;
+}
+
+static int hybrid_gpu_decoded_routed_supported_types(const qwen36_contract_layer *layer) {
+    return layer->ffn_gate_exps &&
+           layer->ffn_up_exps &&
+           layer->ffn_down_exps &&
+           gpu_decoded_expert_type_supported(layer->ffn_gate_exps->type) &&
+           gpu_decoded_expert_type_supported(layer->ffn_up_exps->type) &&
+           gpu_decoded_expert_type_supported(layer->ffn_down_exps->type);
+}
+
+static int hybrid_gpu_dense_matmul_tensor(ds4_gpu_tensor *out,
+                                          const mapped_file *mf,
+                                          const qwen36_gguf_tensor *weight,
+                                          uint64_t in_dim,
+                                          uint64_t out_dim,
+                                          const ds4_gpu_tensor *x,
+                                          uint64_t n_tok) {
+    if (!weight) return 0;
+    switch (weight->type) {
+    case QWEN36_GGUF_TYPE_Q8_0:
+        return ds4_gpu_matmul_q8_0_tensor(out, mf->map, mf->size,
+                                          weight->abs_offset, in_dim, out_dim, x, n_tok);
+    case QWEN36_GGUF_TYPE_F32:
+        return ds4_gpu_matmul_f32_tensor(out, mf->map, mf->size,
+                                         weight->abs_offset, in_dim, out_dim, x, n_tok);
+    case QWEN36_GGUF_TYPE_F16:
+        return ds4_gpu_matmul_f16_tensor(out, mf->map, mf->size,
+                                         weight->abs_offset, in_dim, out_dim, x, n_tok);
+    default:
+        return 0;
+    }
+}
+
+static int gpu_host_f32_matmul_tensor(ds4_gpu_tensor *out,
+                                      const float *weight,
+                                      uint64_t in_dim,
+                                      uint64_t out_dim,
+                                      const ds4_gpu_tensor *x,
+                                      uint64_t n_tok) {
+    const uint64_t weight_bytes = in_dim * out_dim * sizeof(float);
+    if (!weight) return 0;
+    return ds4_gpu_matmul_f32_tensor(out, weight, weight_bytes, 0, in_dim, out_dim, x, n_tok);
+}
+
+static int hybrid_gpu_shared_supported_types(const qwen36_contract_layer *layer) {
+    return layer->ffn_gate_shexp->type == QWEN36_GGUF_TYPE_Q8_0 &&
+           layer->ffn_up_shexp->type == QWEN36_GGUF_TYPE_Q8_0 &&
+           layer->ffn_down_shexp->type == QWEN36_GGUF_TYPE_Q8_0;
 }
 
 static void rotate_half(const float *x, float *out, uint32_t dim) {
@@ -926,7 +1271,7 @@ static void topk_softmax256(const float *logits, uint32_t k, uint32_t *idx, floa
     }
 }
 
-static int ensure_full_expert_loaded(const qwen36_gguf_file *gf, const qwen36_35a3b_q8_layer *layer, full_layer_cache *cache, uint32_t expert_id, char *err, size_t err_cap) {
+static int ensure_full_expert_loaded(const qwen36_gguf_file *gf, const qwen36_contract_layer *layer, full_layer_cache *cache, uint32_t expert_id, char *err, size_t err_cap) {
     expert_cache_entry *e = &cache->experts[expert_id];
     if (e->loaded) return 1;
     e->gate = (float *)malloc((size_t)FULL_INTER * FULL_HIDDEN * sizeof(float));
@@ -940,7 +1285,7 @@ static int ensure_full_expert_loaded(const qwen36_gguf_file *gf, const qwen36_35
     return 1;
 }
 
-static int ensure_full_layer_loaded(const qwen36_gguf_file *gf, const qwen36_35a3b_q8_layer *layer, full_layer_cache *cache, char *err, size_t err_cap) {
+static int ensure_full_layer_loaded(const qwen36_gguf_file *gf, const qwen36_contract_layer *layer, full_layer_cache *cache, char *err, size_t err_cap) {
     if (cache->loaded) return 1;
     if (!read_f32_tensor(gf, layer->attn_norm, &cache->attn_norm_w, FULL_HIDDEN, err, err_cap)) return 0;
     if (!read_f32_tensor(gf, layer->post_attn_norm, &cache->post_attn_norm_w, FULL_HIDDEN, err, err_cap)) return 0;
@@ -968,7 +1313,7 @@ static int ensure_full_layer_loaded(const qwen36_gguf_file *gf, const qwen36_35a
     return 1;
 }
 
-static int run_full_layer_prefill_cpu(const qwen36_35a3b_q8_layer *layer,
+static int run_full_layer_prefill_cpu(const qwen36_contract_layer *layer,
                                       full_layer_cache *cache,
                                       full_layer_state *state,
                                       const qwen36_gguf_file *gf,
@@ -1107,7 +1452,7 @@ fail:
     return 0;
 }
 
-static int run_full_layer_step_cpu(const qwen36_35a3b_q8_layer *layer,
+static int run_full_layer_step_cpu(const qwen36_contract_layer *layer,
                                    full_layer_cache *cache,
                                    full_layer_state *state,
                                    const qwen36_gguf_file *gf,
@@ -1217,7 +1562,7 @@ static int run_full_layer_step_cpu(const qwen36_35a3b_q8_layer *layer,
     return 1;
 }
 
-static int run_full_layer_step_cpu_debug(const qwen36_35a3b_q8_layer *layer,
+static int run_full_layer_step_cpu_debug(const qwen36_contract_layer *layer,
                                          full_layer_cache *cache,
                                          full_layer_state *state,
                                          const qwen36_gguf_file *gf,
@@ -1402,7 +1747,7 @@ fail:
     return 0;
 }
 
-static int ensure_expert_loaded(const qwen36_gguf_file *gf, const qwen36_35a3b_q8_layer *layer, expert_cache_entry *cache, uint32_t expert_id, uint32_t hidden, uint32_t inter, char *err, size_t err_cap) {
+static int ensure_expert_loaded(const qwen36_gguf_file *gf, const qwen36_contract_layer *layer, expert_cache_entry *cache, uint32_t expert_id, uint32_t hidden, uint32_t inter, char *err, size_t err_cap) {
     expert_cache_entry *e = &cache[expert_id];
     if (e->loaded) return 1;
     e->gate = (float *)malloc((size_t)inter * hidden * sizeof(float));
@@ -1514,9 +1859,12 @@ static void free_layer_step_scratch(layer_step_scratch *sc) {
     ds4_gpu_tensor_free(sc->input_ln_gpu);
     ds4_gpu_tensor_free(sc->input_gpu);
     ds4_gpu_tensor_free(sc->expert_down_gpu);
+    ds4_gpu_tensor_free(sc->routed_out_gpu);
     ds4_gpu_tensor_free(sc->expert_mid_gpu);
     ds4_gpu_tensor_free(sc->expert_up_gpu);
     ds4_gpu_tensor_free(sc->expert_gate_gpu);
+    ds4_gpu_tensor_free(sc->router_weights_gpu);
+    ds4_gpu_tensor_free(sc->router_selected_gpu);
     ds4_gpu_tensor_free(sc->shared_out_gpu);
     ds4_gpu_tensor_free(sc->shared_mid_gpu);
     ds4_gpu_tensor_free(sc->shared_up_gpu);
@@ -1672,6 +2020,93 @@ static void boundary_dbg_report_layer_runtime(uint32_t step,
     boundary_dbg_report_signature(step, label, rt->conv_ring[1], qkv_dim);
     snprintf(label, sizeof(label), "L%u_CONV2", layer);
     boundary_dbg_report_signature(step, label, rt->conv_ring[2], qkv_dim);
+}
+
+static int prefill_cycle_dbg_enabled(void) {
+    static int init = 0;
+    static int enabled = 0;
+    if (!init) {
+        const char *env = getenv("QWEN36_DBG_PREFILL_CYCLE_SIG");
+        if (env && env[0] && strcmp(env, "0") != 0) enabled = 1;
+        init = 1;
+    }
+    return enabled;
+}
+
+static int prefill_boundary_dbg_enabled(void) {
+    static int init = 0;
+    static int enabled = 0;
+    if (!init) {
+        const char *env = getenv("QWEN36_DBG_PREFILL_BOUNDARY");
+        if (env && env[0] && strcmp(env, "0") != 0) enabled = 1;
+        init = 1;
+    }
+    return enabled;
+}
+
+static void prefill_cycle_dbg_report_signature(const unified_session_state *st,
+                                               uint32_t cycle_idx,
+                                               const char *phase,
+                                               const float *vals,
+                                               size_t count) {
+    size_t i;
+    const size_t head_n = count < 8 ? count : 8;
+    double sum = 0.0, sum_sq = 0.0;
+    float max_abs = 0.0f;
+    if (!prefill_cycle_dbg_enabled()) return;
+    fprintf(stderr, "=== DBG_PREFILL_CYCLE[%u] mode=%s phase=%s",
+            cycle_idx,
+            st->enable_full_prefill_cpu ? "cpu" :
+#ifdef QWEN36_UNIFIED_HAVE_GPU
+            (st->enable_full_prefill_gpu ? "gpu" : "none"),
+#else
+            "none",
+#endif
+            phase);
+    for (i = 0; i < count; ++i) {
+        const float v = vals[i];
+        const float av = fabsf(v);
+        sum += (double)v;
+        sum_sq += (double)v * (double)v;
+        if (av > max_abs) max_abs = av;
+    }
+    fprintf(stderr, " mean=%.8f rms=%.8f max_abs=%.8f head=",
+            count ? (sum / (double)count) : 0.0,
+            count ? sqrt(sum_sq / (double)count) : 0.0,
+            max_abs);
+    for (i = 0; i < head_n; ++i) {
+        fprintf(stderr, "%s%.8f", i ? "," : "", (double)vals[i]);
+    }
+    fprintf(stderr, "\n");
+    fflush(stderr);
+}
+
+static void prefill_boundary_dbg_report_signature(uint32_t cycle_idx,
+                                                  const char *label,
+                                                  const float *vals,
+                                                  size_t count) {
+    size_t i;
+    const size_t head_n = count < 8 ? count : 8;
+    double sum = 0.0, sum_sq = 0.0;
+    float max_abs = 0.0f;
+    if (!prefill_boundary_dbg_enabled()) return;
+    fprintf(stderr, "=== DBG_PREFILL_BOUNDARY[%u] %s", cycle_idx, label);
+    for (i = 0; i < count; ++i) {
+        const float v = vals[i];
+        const float av = fabsf(v);
+        sum += (double)v;
+        sum_sq += (double)v * (double)v;
+        if (av > max_abs) max_abs = av;
+    }
+    fprintf(stderr, " mean=%.8f rms=%.8f max_abs=%.8f head=",
+            count ? (sum / (double)count) : 0.0,
+            count ? sqrt(sum_sq / (double)count) : 0.0,
+            max_abs);
+    for (i = 0; i < head_n; ++i) {
+        fprintf(stderr, "%s%.8f", i ? "," : "", (double)vals[i]);
+    }
+    fprintf(stderr, "\n");
+    fflush(stderr);
 }
 
 static void hybrid_dbg_report_signature(uint32_t layer,
@@ -1951,7 +2386,7 @@ static int clone_full_layer_state_for_debug(const full_layer_state *src,
 }
 
 static int clone_full_layer_cache_for_debug(const qwen36_gguf_file *gf,
-                                            const qwen36_35a3b_q8_layer *layer,
+                                            const qwen36_contract_layer *layer,
                                             full_layer_cache *dst,
                                             char *err,
                                             size_t err_cap) {
@@ -1996,12 +2431,17 @@ static int ensure_layer_gpu_step_scratch(const live_fixture *fx, layer_step_scra
     sc->expert_up_gpu = ds4_gpu_tensor_alloc(inter_bytes);
     sc->expert_mid_gpu = ds4_gpu_tensor_alloc(inter_bytes);
     sc->expert_down_gpu = ds4_gpu_tensor_alloc((uint64_t)fx->topk * hidden_bytes);
+    sc->routed_out_gpu = ds4_gpu_tensor_alloc(hidden_bytes);
+    sc->router_selected_gpu = ds4_gpu_tensor_alloc((uint64_t)fx->topk * sizeof(int32_t));
+    sc->router_weights_gpu = ds4_gpu_tensor_alloc((uint64_t)fx->topk * sizeof(float));
     sc->q_gpu = ds4_gpu_tensor_alloc((uint64_t)fx->key_dim * sizeof(float));
     sc->k_gpu = ds4_gpu_tensor_alloc((uint64_t)fx->key_dim * sizeof(float));
     sc->v_gpu = ds4_gpu_tensor_alloc((uint64_t)fx->value_dim * sizeof(float));
     if (!sc->input_gpu || !sc->input_ln_gpu || !sc->z_gpu || !sc->a_gpu || !sc->b_gpu || !sc->out_in_gpu || !sc->out_proj_gpu ||
         !sc->post_gpu || !sc->router_logits_gpu || !sc->shared_gate_gpu || !sc->shared_up_gpu || !sc->shared_mid_gpu ||
         !sc->shared_out_gpu || !sc->expert_gate_gpu || !sc->expert_up_gpu || !sc->expert_mid_gpu || !sc->expert_down_gpu ||
+        !sc->routed_out_gpu ||
+        !sc->router_selected_gpu || !sc->router_weights_gpu ||
         !sc->q_gpu || !sc->k_gpu || !sc->v_gpu) {
         snprintf(err, err_cap, "gpu tensor alloc failed blk.%u", fx->layer);
         return 0;
@@ -2012,7 +2452,7 @@ static int ensure_layer_gpu_step_scratch(const live_fixture *fx, layer_step_scra
 
 static int run_step_layer_dynamic(const live_fixture *fx,
                                   const qwen36_gguf_file *gf,
-                                  const qwen36_35a3b_q8_layer *layer,
+                                  const qwen36_contract_layer *layer,
                                   layer_runtime *ls,
                                   const float *layer_input,
                                   float *out_row,
@@ -2211,7 +2651,7 @@ static int run_step_layer_dynamic(const live_fixture *fx,
 #ifdef QWEN36_UNIFIED_HAVE_GPU
 static int run_hybrid_layer_step_gpuproj(const live_fixture *fx,
                                          const qwen36_gguf_file *gf,
-                                         const qwen36_35a3b_q8_layer *layer,
+                                         const qwen36_contract_layer *layer,
                                          const mapped_file *mf,
                                          layer_runtime *ls,
                                          const float *layer_input,
@@ -2235,6 +2675,17 @@ static int run_hybrid_layer_step_gpuproj(const live_fixture *fx,
     float router_logits[ROUTER_COUNT];
     uint32_t router_idx[ROUTER_COUNT];
     float router_scores[ROUTER_COUNT];
+    const int use_gpu_shared = hybrid_gpu_shared_supported_types(layer);
+    const int use_gpu_routed = hybrid_gpu_routed_supported_types(layer);
+    const int use_gpu_routed_moe =
+        env_enabled_default_on("QWEN36_FULL_GPU_ROUTED_MOE") &&
+        !use_gpu_routed &&
+        hybrid_gpu_routed_moe_supported_types(layer);
+    const int use_gpu_routed_decoded =
+        getenv("QWEN36_GPU_DECODED_EXPERTS") != NULL &&
+        !use_gpu_routed && !use_gpu_routed_moe &&
+        hybrid_gpu_decoded_routed_supported_types(layer);
+    const int path_audit = getenv("QWEN36_PATH_AUDIT") != NULL;
     uint32_t h, d, vd, i;
     static int dbg_gpu_step = 0;
     int dbg_step_id = dbg_gpu_step;
@@ -2267,6 +2718,22 @@ static int run_hybrid_layer_step_gpuproj(const live_fixture *fx,
     if (!ensure_layer_gpu_step_scratch(fx, sc, err, err_cap)) {
         goto cleanup;
     }
+    if (path_audit) {
+        fprintf(stderr,
+                "qwen36_path hybrid layer=%u shared_gpu=%d q8_expert_gpu=%d routed_moe=%d decoded_expert_gpu=%d gate=%s up=%s down=%s shared_gate=%s shared_up=%s shared_down=%s\n",
+                fx->layer,
+                use_gpu_shared,
+                use_gpu_routed,
+                use_gpu_routed_moe,
+                use_gpu_routed_decoded,
+                qwen36_gguf_type_name(layer->ffn_gate_exps->type),
+                qwen36_gguf_type_name(layer->ffn_up_exps->type),
+                qwen36_gguf_type_name(layer->ffn_down_exps->type),
+                qwen36_gguf_type_name(layer->ffn_gate_shexp->type),
+                qwen36_gguf_type_name(layer->ffn_up_shexp->type),
+                qwen36_gguf_type_name(layer->ffn_down_shexp->type));
+        fflush(stderr);
+    }
     input_gpu = sc->input_gpu;
     input_ln_gpu = sc->input_ln_gpu;
     z_gpu = sc->z_gpu;
@@ -2291,18 +2758,18 @@ static int run_hybrid_layer_step_gpuproj(const live_fixture *fx,
         snprintf(err, err_cap, "gpu rmsnorm failed blk.%u", fx->layer);
         goto cleanup;
     }
-    if (ds4_gpu_matmul_q8_0_tensor(z_gpu, mf->map, mf->size,
-                                   layer->attn_gate->abs_offset, fx->hidden, fx->value_dim, input_ln_gpu, 1u) == 0) {
+    if (hybrid_gpu_dense_matmul_tensor(z_gpu, mf, layer->attn_gate,
+                                       fx->hidden, fx->value_dim, input_ln_gpu, 1u) == 0) {
         snprintf(err, err_cap, "gpu z matmul failed blk.%u", fx->layer);
         goto cleanup;
     }
-    if (ds4_gpu_matmul_q8_0_tensor(a_gpu, mf->map, mf->size,
-                                   layer->ssm_alpha->abs_offset, fx->hidden, fx->num_v_heads, input_ln_gpu, 1u) == 0) {
+    if (hybrid_gpu_dense_matmul_tensor(a_gpu, mf, layer->ssm_alpha,
+                                       fx->hidden, fx->num_v_heads, input_ln_gpu, 1u) == 0) {
         snprintf(err, err_cap, "gpu a matmul failed blk.%u", fx->layer);
         goto cleanup;
     }
-    if (ds4_gpu_matmul_q8_0_tensor(b_gpu, mf->map, mf->size,
-                                    layer->ssm_beta->abs_offset, fx->hidden, fx->num_v_heads, input_ln_gpu, 1u) == 0) {
+    if (hybrid_gpu_dense_matmul_tensor(b_gpu, mf, layer->ssm_beta,
+                                       fx->hidden, fx->num_v_heads, input_ln_gpu, 1u) == 0) {
         snprintf(err, err_cap, "gpu b matmul failed blk.%u", fx->layer);
         goto cleanup;
     }
@@ -2443,8 +2910,8 @@ static int run_hybrid_layer_step_gpuproj(const live_fixture *fx,
         snprintf(err, err_cap, "gpu begin out_proj failed blk.%u", fx->layer);
         goto cleanup;
     }
-    if (ds4_gpu_matmul_q8_0_tensor(out_proj_gpu, mf->map, mf->size,
-                                   layer->ssm_out->abs_offset, fx->value_dim, fx->hidden, out_in_gpu, 1u) == 0) {
+    if (hybrid_gpu_dense_matmul_tensor(out_proj_gpu, mf, layer->ssm_out,
+                                       fx->value_dim, fx->hidden, out_in_gpu, 1u) == 0) {
         snprintf(err, err_cap, "gpu out_proj failed blk.%u", fx->layer);
         goto cleanup;
     }
@@ -2488,20 +2955,22 @@ static int run_hybrid_layer_step_gpuproj(const live_fixture *fx,
             snprintf(err, err_cap, "gpu router failed blk.%u", fx->layer);
             goto cleanup;
         }
-        if (ds4_gpu_shared_gate_up_swiglu_q8_0_tensor(sc->shared_gate_gpu, sc->shared_up_gpu, sc->shared_mid_gpu,
-                                                      mf->map, mf->size,
-                                                      layer->ffn_gate_shexp->abs_offset,
-                                                      layer->ffn_up_shexp->abs_offset,
-                                                      fx->hidden, fx->inter, sc->post_gpu,
-                                                      80.0f) == 0) {
-            snprintf(err, err_cap, "gpu shared gate/up failed blk.%u", fx->layer);
-            goto cleanup;
-        }
-        if (ds4_gpu_matmul_q8_0_tensor(sc->shared_out_gpu, mf->map, mf->size,
-                                       layer->ffn_down_shexp->abs_offset,
-                                       fx->inter, fx->hidden, sc->shared_mid_gpu, 1u) == 0) {
-            snprintf(err, err_cap, "gpu shared down failed blk.%u", fx->layer);
-            goto cleanup;
+        if (use_gpu_shared) {
+            if (ds4_gpu_shared_gate_up_swiglu_q8_0_tensor(sc->shared_gate_gpu, sc->shared_up_gpu, sc->shared_mid_gpu,
+                                                          mf->map, mf->size,
+                                                          layer->ffn_gate_shexp->abs_offset,
+                                                          layer->ffn_up_shexp->abs_offset,
+                                                          fx->hidden, fx->inter, sc->post_gpu,
+                                                          80.0f) == 0) {
+                snprintf(err, err_cap, "gpu shared gate/up failed blk.%u", fx->layer);
+                goto cleanup;
+            }
+            if (ds4_gpu_matmul_q8_0_tensor(sc->shared_out_gpu, mf->map, mf->size,
+                                           layer->ffn_down_shexp->abs_offset,
+                                           fx->inter, fx->hidden, sc->shared_mid_gpu, 1u) == 0) {
+                snprintf(err, err_cap, "gpu shared down failed blk.%u", fx->layer);
+                goto cleanup;
+            }
         }
         if (ds4_gpu_end_commands() == 0) {
             snprintf(err, err_cap, "gpu ffn end failed blk.%u", fx->layer);
@@ -2511,60 +2980,198 @@ static int run_hybrid_layer_step_gpuproj(const live_fixture *fx,
             snprintf(err, err_cap, "gpu router readback failed blk.%u", fx->layer);
             goto cleanup;
         }
-        if (ds4_gpu_tensor_read(sc->shared_out_gpu, 0, shared, hidden_bytes) == 0) {
-            snprintf(err, err_cap, "gpu shared readback failed blk.%u", fx->layer);
-            goto cleanup;
+        if (use_gpu_shared) {
+            if (ds4_gpu_tensor_read(sc->shared_out_gpu, 0, shared, hidden_bytes) == 0) {
+                snprintf(err, err_cap, "gpu shared readback failed blk.%u", fx->layer);
+                goto cleanup;
+            }
         }
         topk_softmax256(router_logits, fx->topk, router_idx, router_scores);
-        if (ds4_gpu_begin_commands() == 0) {
-            snprintf(err, err_cap, "gpu experts begin failed blk.%u", fx->layer);
-            goto cleanup;
-        }
-        for (i = 0; i < fx->topk; ++i) {
-            const uint64_t gate_expert_bytes = (uint64_t)(fx->inter * fx->hidden / 32u) * 34u;
-            const uint64_t down_expert_bytes = (uint64_t)(fx->hidden * fx->inter / 32u) * 34u;
-            const uint32_t expert_id = router_idx[i];
-            ds4_gpu_tensor *expert_slot = ds4_gpu_tensor_view(sc->expert_down_gpu,
-                                                               (uint64_t)i * hidden_bytes,
-                                                               hidden_bytes);
-            if (!expert_slot) {
-                snprintf(err, err_cap, "gpu expert slot view failed blk.%u", fx->layer);
+        if (use_gpu_routed_moe) {
+            int32_t router_selected_i32[ROUTER_COUNT];
+            const uint64_t gate_row_bytes = tensor_row_bytes(layer->ffn_gate_exps, fx->hidden);
+            const uint64_t gate_expert_bytes = gate_row_bytes * fx->inter;
+            const uint64_t down_row_bytes = tensor_row_bytes(layer->ffn_down_exps, fx->inter);
+            const uint64_t down_expert_bytes = down_row_bytes * fx->hidden;
+            for (i = 0; i < fx->topk; ++i) router_selected_i32[i] = (int32_t)router_idx[i];
+            if (gate_row_bytes == 0 || down_row_bytes == 0) {
+                snprintf(err, err_cap, "gpu routed moe row bytes failed blk.%u", fx->layer);
                 goto cleanup;
             }
-            if (ds4_gpu_matmul_q8_0_pair_tensor(sc->expert_gate_gpu, sc->expert_up_gpu,
-                                                mf->map, mf->size,
-                                                layer->ffn_gate_exps->abs_offset + gate_expert_bytes * expert_id,
-                                                layer->ffn_up_exps->abs_offset + gate_expert_bytes * expert_id,
-                                                fx->hidden, fx->inter, fx->inter, sc->post_gpu, 1u) == 0) {
+            if (ds4_gpu_tensor_write(sc->router_selected_gpu, 0, router_selected_i32,
+                                     (uint64_t)fx->topk * sizeof(int32_t)) == 0 ||
+                ds4_gpu_tensor_write(sc->router_weights_gpu, 0, router_scores,
+                                     (uint64_t)fx->topk * sizeof(float)) == 0) {
+                snprintf(err, err_cap, "gpu routed moe router write failed blk.%u", fx->layer);
+                goto cleanup;
+            }
+            if (ds4_gpu_begin_commands() == 0) {
+                snprintf(err, err_cap, "gpu routed moe begin failed blk.%u", fx->layer);
+                goto cleanup;
+            }
+            if (ds4_gpu_routed_moe_one_tensor(sc->routed_out_gpu,
+                                              sc->expert_gate_gpu,
+                                              sc->expert_up_gpu,
+                                              sc->expert_mid_gpu,
+                                              sc->expert_down_gpu,
+                                              mf->map,
+                                              mf->size,
+                                              layer->ffn_gate_exps->abs_offset,
+                                              layer->ffn_up_exps->abs_offset,
+                                              layer->ffn_down_exps->abs_offset,
+                                              layer->ffn_gate_exps->type,
+                                              layer->ffn_down_exps->type,
+                                              gate_expert_bytes,
+                                              gate_row_bytes,
+                                              down_expert_bytes,
+                                              down_row_bytes,
+                                              fx->hidden,
+                                              fx->inter,
+                                              fx->hidden,
+                                              sc->router_selected_gpu,
+                                              sc->router_weights_gpu,
+                                              ROUTER_COUNT,
+                                              fx->topk,
+                                              80.0f,
+                                              sc->post_gpu,
+                                              fx->layer) == 0) {
+                snprintf(err, err_cap, "gpu routed moe failed blk.%u", fx->layer);
+                goto cleanup;
+            }
+            if (ds4_gpu_end_commands() == 0) {
+                snprintf(err, err_cap, "gpu routed moe end failed blk.%u", fx->layer);
+                goto cleanup;
+            }
+            if (ds4_gpu_tensor_read(sc->routed_out_gpu, 0, mlp, hidden_bytes) == 0) {
+                snprintf(err, err_cap, "gpu routed moe readback failed blk.%u", fx->layer);
+                goto cleanup;
+            }
+        } else if (use_gpu_routed) {
+            const uint64_t gate_row_bytes = tensor_row_bytes(layer->ffn_gate_exps, fx->hidden);
+            const uint64_t gate_expert_bytes = gate_row_bytes * fx->inter;
+            const uint64_t down_row_bytes = tensor_row_bytes(layer->ffn_down_exps, fx->inter);
+            const uint64_t down_expert_bytes = down_row_bytes * fx->hidden;
+            if (ds4_gpu_begin_commands() == 0) {
+                snprintf(err, err_cap, "gpu experts begin failed blk.%u", fx->layer);
+                goto cleanup;
+            }
+            for (i = 0; i < fx->topk; ++i) {
+                const uint32_t expert_id = router_idx[i];
+                ds4_gpu_tensor *expert_slot = ds4_gpu_tensor_view(sc->expert_down_gpu,
+                                                                   (uint64_t)i * hidden_bytes,
+                                                                   hidden_bytes);
+                if (!expert_slot) {
+                    snprintf(err, err_cap, "gpu expert slot view failed blk.%u", fx->layer);
+                    goto cleanup;
+                }
+                if (ds4_gpu_matmul_q8_0_pair_tensor(sc->expert_gate_gpu, sc->expert_up_gpu,
+                                                    mf->map, mf->size,
+                                                    layer->ffn_gate_exps->abs_offset + gate_expert_bytes * expert_id,
+                                                    layer->ffn_up_exps->abs_offset + gate_expert_bytes * expert_id,
+                                                    fx->hidden, fx->inter, fx->inter, sc->post_gpu, 1u) == 0) {
+                    ds4_gpu_tensor_free(expert_slot);
+                    snprintf(err, err_cap, "gpu expert gate/up failed blk.%u", fx->layer);
+                    goto cleanup;
+                }
+                if (ds4_gpu_swiglu_tensor(sc->expert_mid_gpu, sc->expert_gate_gpu, sc->expert_up_gpu,
+                                          fx->inter, 80.0f, 1.0f) == 0) {
+                    ds4_gpu_tensor_free(expert_slot);
+                    snprintf(err, err_cap, "gpu expert swiglu failed blk.%u", fx->layer);
+                    goto cleanup;
+                }
+                if (ds4_gpu_matmul_q8_0_tensor(expert_slot, mf->map, mf->size,
+                                               layer->ffn_down_exps->abs_offset + down_expert_bytes * expert_id,
+                                               fx->inter, fx->hidden, sc->expert_mid_gpu, 1u) == 0) {
+                    ds4_gpu_tensor_free(expert_slot);
+                    snprintf(err, err_cap, "gpu expert down failed blk.%u", fx->layer);
+                    goto cleanup;
+                }
                 ds4_gpu_tensor_free(expert_slot);
-                snprintf(err, err_cap, "gpu expert gate/up failed blk.%u", fx->layer);
+            }
+            if (ds4_gpu_end_commands() == 0) {
+                snprintf(err, err_cap, "gpu experts end failed blk.%u", fx->layer);
                 goto cleanup;
             }
-            if (ds4_gpu_swiglu_tensor(sc->expert_mid_gpu, sc->expert_gate_gpu, sc->expert_up_gpu,
-                                      fx->inter, 80.0f, 1.0f) == 0) {
+            for (i = 0; i < fx->topk; ++i) {
+                if (ds4_gpu_tensor_read(sc->expert_down_gpu, (uint64_t)i * hidden_bytes, down, hidden_bytes) == 0) {
+                    snprintf(err, err_cap, "gpu expert readback failed blk.%u", fx->layer);
+                    goto cleanup;
+                }
+                for (d = 0; d < fx->hidden; ++d) mlp[d] += down[d] * router_scores[i];
+            }
+        } else if (use_gpu_routed_decoded) {
+            if (ds4_gpu_begin_commands() == 0) {
+                snprintf(err, err_cap, "gpu decoded experts begin failed blk.%u", fx->layer);
+                goto cleanup;
+            }
+            for (i = 0; i < fx->topk; ++i) {
+                const uint32_t expert_id = router_idx[i];
+                const expert_cache_entry *e = &ls->experts[expert_id];
+                ds4_gpu_tensor *expert_slot = ds4_gpu_tensor_view(sc->expert_down_gpu,
+                                                                  (uint64_t)i * hidden_bytes,
+                                                                  hidden_bytes);
+                if (!ensure_expert_loaded(gf, layer, ls->experts, expert_id, fx->hidden, fx->inter, err, err_cap)) {
+                    if (expert_slot) ds4_gpu_tensor_free(expert_slot);
+                    goto cleanup;
+                }
+                if (!expert_slot) {
+                    snprintf(err, err_cap, "gpu decoded expert slot view failed blk.%u", fx->layer);
+                    goto cleanup;
+                }
+                if (gpu_host_f32_matmul_tensor(sc->expert_gate_gpu, e->gate,
+                                               fx->hidden, fx->inter, sc->post_gpu, 1u) == 0) {
+                    ds4_gpu_tensor_free(expert_slot);
+                    snprintf(err, err_cap, "gpu decoded expert gate failed blk.%u", fx->layer);
+                    goto cleanup;
+                }
+                if (gpu_host_f32_matmul_tensor(sc->expert_up_gpu, e->up,
+                                               fx->hidden, fx->inter, sc->post_gpu, 1u) == 0) {
+                    ds4_gpu_tensor_free(expert_slot);
+                    snprintf(err, err_cap, "gpu decoded expert up failed blk.%u", fx->layer);
+                    goto cleanup;
+                }
+                if (ds4_gpu_swiglu_tensor(sc->expert_mid_gpu, sc->expert_gate_gpu, sc->expert_up_gpu,
+                                          fx->inter, 80.0f, 1.0f) == 0) {
+                    ds4_gpu_tensor_free(expert_slot);
+                    snprintf(err, err_cap, "gpu decoded expert swiglu failed blk.%u", fx->layer);
+                    goto cleanup;
+                }
+                if (gpu_host_f32_matmul_tensor(expert_slot, e->down,
+                                               fx->inter, fx->hidden, sc->expert_mid_gpu, 1u) == 0) {
+                    ds4_gpu_tensor_free(expert_slot);
+                    snprintf(err, err_cap, "gpu decoded expert down failed blk.%u", fx->layer);
+                    goto cleanup;
+                }
                 ds4_gpu_tensor_free(expert_slot);
-                snprintf(err, err_cap, "gpu expert swiglu failed blk.%u", fx->layer);
+            }
+            if (ds4_gpu_end_commands() == 0) {
+                snprintf(err, err_cap, "gpu decoded experts end failed blk.%u", fx->layer);
                 goto cleanup;
             }
-            if (ds4_gpu_matmul_q8_0_tensor(expert_slot, mf->map, mf->size,
-                                           layer->ffn_down_exps->abs_offset + down_expert_bytes * expert_id,
-                                           fx->inter, fx->hidden, sc->expert_mid_gpu, 1u) == 0) {
-                ds4_gpu_tensor_free(expert_slot);
-                snprintf(err, err_cap, "gpu expert down failed blk.%u", fx->layer);
-                goto cleanup;
+            for (i = 0; i < fx->topk; ++i) {
+                if (ds4_gpu_tensor_read(sc->expert_down_gpu, (uint64_t)i * hidden_bytes, down, hidden_bytes) == 0) {
+                    snprintf(err, err_cap, "gpu decoded expert readback failed blk.%u", fx->layer);
+                    goto cleanup;
+                }
+                for (d = 0; d < fx->hidden; ++d) mlp[d] += down[d] * router_scores[i];
             }
-            ds4_gpu_tensor_free(expert_slot);
+        } else {
+            for (i = 0; i < fx->topk; ++i) {
+                if (!ensure_expert_loaded(gf, layer, ls->experts, router_idx[i], fx->hidden, fx->inter, err, err_cap)) {
+                    goto cleanup;
+                }
+                matvec(ls->experts[router_idx[i]].gate, post_ln, gate, fx->inter, fx->hidden);
+                matvec(ls->experts[router_idx[i]].up, post_ln, up, fx->inter, fx->hidden);
+                for (vd = 0; vd < fx->inter; ++vd) act[vd] = siluf_local(gate[vd]) * up[vd];
+                matvec(ls->experts[router_idx[i]].down, act, down, fx->hidden, fx->inter);
+                for (d = 0; d < fx->hidden; ++d) mlp[d] += down[d] * router_scores[i];
+            }
         }
-        if (ds4_gpu_end_commands() == 0) {
-            snprintf(err, err_cap, "gpu experts end failed blk.%u", fx->layer);
-            goto cleanup;
-        }
-        for (i = 0; i < fx->topk; ++i) {
-            if (ds4_gpu_tensor_read(sc->expert_down_gpu, (uint64_t)i * hidden_bytes, down, hidden_bytes) == 0) {
-                snprintf(err, err_cap, "gpu expert readback failed blk.%u", fx->layer);
-                goto cleanup;
-            }
-            for (d = 0; d < fx->hidden; ++d) mlp[d] += down[d] * router_scores[i];
+        if (!use_gpu_shared) {
+            matvec(fx->gate_shexp, post_ln, shared_gate, fx->inter, fx->hidden);
+            matvec(fx->up_shexp, post_ln, shared_up, fx->inter, fx->hidden);
+            for (vd = 0; vd < fx->inter; ++vd) shared_act[vd] = siluf_local(shared_gate[vd]) * shared_up[vd];
+            matvec(fx->down_shexp, shared_act, shared, fx->hidden, fx->inter);
         }
         {
             float s = sigmoidf_local(scale_in);
@@ -2637,12 +3244,22 @@ static void session_clear_decode_state(unified_session_state *st) {
     if (st->cycle_owned_seqs) {
         for (li = 0; li < st->cfg.n_cycles; ++li) free(st->cycle_owned_seqs[li]);
     }
+    if (st->cycle_pre_full_rows) {
+        for (li = 0; li < st->cfg.n_cycles; ++li) free(st->cycle_pre_full_rows[li]);
+    }
+    if (st->cycle_owned_rows) {
+        for (li = 0; li < st->cfg.n_cycles; ++li) free(st->cycle_owned_rows[li]);
+    }
     free(st->cycle_pre_full_seqs);
     free(st->cycle_owned_seqs);
+    free(st->cycle_pre_full_rows);
+    free(st->cycle_owned_rows);
     st->token_ids = NULL;
     st->owned_seq = NULL;
     st->cycle_pre_full_seqs = NULL;
     st->cycle_owned_seqs = NULL;
+    st->cycle_pre_full_rows = NULL;
+    st->cycle_owned_rows = NULL;
     st->seq_len = 0;
     st->prefill_base_seq_len = 0;
     st->owned_cap = 0;
@@ -2691,7 +3308,7 @@ static int session_init_runtime(unified_session_state *st, const char *gguf_path
 #endif
     for (ci = 0; ci < st->cfg.n_cycles; ++ci) total_fixtures += st->cfg.cycles[ci].n_fixtures;
     if (!qwen36_gguf_open(&st->gf, gguf_path, err, err_cap)) return 0;
-    if (!qwen36_35a3b_q8_bind(&st->gf, &st->model, err, err_cap)) {
+    if (!bind_contract_model(&st->gf, &st->model, err, err_cap)) {
         qwen36_gguf_close(&st->gf);
         memset(&st->gf, 0, sizeof(st->gf));
         return 0;
@@ -2699,7 +3316,14 @@ static int session_init_runtime(unified_session_state *st, const char *gguf_path
     st->fxs = (live_fixture *)calloc(total_fixtures, sizeof(live_fixture));
     st->layers = (layer_runtime *)calloc(total_fixtures, sizeof(layer_runtime));
     st->cycle_fx_offsets = (uint32_t *)calloc(st->cfg.n_cycles + 1u, sizeof(uint32_t));
-    st->full_caches = st->enable_full_prefill_cpu ? (full_layer_cache *)calloc(st->cfg.n_cycles, sizeof(full_layer_cache)) : NULL;
+    st->full_caches =
+        (st->enable_full_prefill_cpu
+#ifdef QWEN36_UNIFIED_HAVE_GPU
+         || st->enable_full_prefill_gpu
+#endif
+        )
+            ? (full_layer_cache *)calloc(st->cfg.n_cycles, sizeof(full_layer_cache))
+            : NULL;
     st->full_states =
         (st->enable_full_prefill_cpu
 #ifdef QWEN36_UNIFIED_HAVE_GPU
@@ -2711,7 +3335,12 @@ static int session_init_runtime(unified_session_state *st, const char *gguf_path
 #ifdef QWEN36_UNIFIED_HAVE_GPU
     st->full_small_caches = st->enable_full_prefill_gpu ? (full_layer_small_cache *)calloc(st->cfg.n_cycles, sizeof(full_layer_small_cache)) : NULL;
 #endif
-    if (!st->fxs || !st->layers || !st->cycle_fx_offsets || (st->enable_full_prefill_cpu && (!st->full_caches || !st->full_states))
+    if (!st->fxs || !st->layers || !st->cycle_fx_offsets ||
+        ((st->enable_full_prefill_cpu
+#ifdef QWEN36_UNIFIED_HAVE_GPU
+          || st->enable_full_prefill_gpu
+#endif
+         ) && (!st->full_caches || !st->full_states))
 #ifdef QWEN36_UNIFIED_HAVE_GPU
         || (st->enable_full_prefill_gpu && (!st->full_small_caches))
 #endif
@@ -2752,7 +3381,7 @@ static int session_init_runtime(unified_session_state *st, const char *gguf_path
 #endif
             ) {
             const uint32_t full_layer = st->cfg.cycles[ci].full_layer;
-            if (full_layer >= QWEN36_35A3B_Q8_BLOCK_COUNT || st->model.layers[full_layer].kind != QWEN36_LAYER_KIND_FULL_ATTENTION) {
+            if (full_layer >= QWEN36_35A3B_Q8_BLOCK_COUNT || st->model.layers[full_layer].kind != QWEN36_CONTRACT_LAYER_KIND_FULL_ATTENTION) {
                 snprintf(err, err_cap, "bad full layer %u", full_layer);
                 return 0;
             }
@@ -2877,6 +3506,12 @@ static int session_prefill(unified_session_state *st,
     } else {
         memcpy(state_seq, input_seq, seq_hidden * sizeof(float));
     }
+    if (seq_len > 0u) {
+        prefill_boundary_dbg_report_signature(0u,
+                                              "INPUT_EMBD_LAST",
+                                              state_seq + (size_t)(seq_len - 1u) * hidden,
+                                              hidden);
+    }
     for (ci = 0; ci < st->cfg.n_cycles; ++ci) {
         uint32_t start = st->cycle_fx_offsets[ci];
         uint32_t end = st->cycle_fx_offsets[ci + 1u];
@@ -2911,11 +3546,26 @@ static int session_prefill(unified_session_state *st,
             free(state_seq);
             state_seq = next_seq;
             next_seq = NULL;
+            if (seq_len > 0u) {
+                char boundary_label[32];
+                snprintf(boundary_label, sizeof(boundary_label), "POST_L%u_LAST", st->fxs[li].layer);
+                prefill_boundary_dbg_report_signature(ci,
+                                                      boundary_label,
+                                                      state_seq + (size_t)(seq_len - 1u) * hidden,
+                                                      hidden);
+            }
         }
         if (!st->cycle_pre_full_seqs) {
             st->cycle_pre_full_seqs = (float **)calloc(st->cfg.n_cycles, sizeof(float *));
             if (!st->cycle_pre_full_seqs) {
                 snprintf(err, err_cap, "oom cycle pre-full snapshot table");
+                goto fail;
+            }
+        }
+        if (!st->cycle_pre_full_rows) {
+            st->cycle_pre_full_rows = (float **)calloc(st->cfg.n_cycles, sizeof(float *));
+            if (!st->cycle_pre_full_rows) {
+                snprintf(err, err_cap, "oom cycle pre-full row table");
                 goto fail;
             }
         }
@@ -2925,6 +3575,13 @@ static int session_prefill(unified_session_state *st,
             goto fail;
         }
         memcpy(st->cycle_pre_full_seqs[ci], state_seq, seq_hidden * sizeof(float));
+        st->cycle_pre_full_rows[ci] = (float *)malloc((size_t)hidden * sizeof(float));
+        if (!st->cycle_pre_full_rows[ci]) {
+            snprintf(err, err_cap, "oom cycle pre-full row %u", ci);
+            goto fail;
+        }
+        memcpy(st->cycle_pre_full_rows[ci], state_seq + (size_t)(seq_len - 1u) * hidden, (size_t)hidden * sizeof(float));
+        prefill_cycle_dbg_report_signature(st, ci, "PRE_FULL_LAST", st->cycle_pre_full_rows[ci], hidden);
         if (st->enable_full_prefill_cpu) {
             const uint32_t full_layer = st->cfg.cycles[ci].full_layer;
             double full_t0 = now_ms();
@@ -2944,6 +3601,14 @@ static int session_prefill(unified_session_state *st,
             free(state_seq);
             state_seq = next_seq;
             next_seq = NULL;
+            if (seq_len > 0u) {
+                char boundary_label[32];
+                snprintf(boundary_label, sizeof(boundary_label), "POST_FULL%u_LAST", full_layer);
+                prefill_boundary_dbg_report_signature(ci,
+                                                      boundary_label,
+                                                      state_seq + (size_t)(seq_len - 1u) * hidden,
+                                                      hidden);
+            }
         }
 #ifdef QWEN36_UNIFIED_HAVE_GPU
         else if (st->enable_full_prefill_gpu) {
@@ -2978,7 +3643,7 @@ static int session_prefill(unified_session_state *st,
                         if (!clone_full_layer_state_for_debug(&st->full_states[ci], &dbg_full_stage_state, err, err_cap) ||
                             !clone_full_layer_cache_for_debug(&st->gf, &st->model.layers[full_layer], &dbg_full_stage_cache, err, err_cap)) goto fail;
                     }
-                    if (!run_full_layer_step_gpu(&st->model.layers[full_layer], &st->mf, &st->full_small_caches[ci], &st->full_states[ci], full_input_row, row_out)) {
+                    if (!run_full_layer_step_gpu(&st->gf, &st->model.layers[full_layer], full_layer, &st->mf, &st->full_caches[ci], &st->full_small_caches[ci], &st->full_states[ci], full_input_row, row_out)) {
                         snprintf(err, err_cap, "gpu full prefill debug failed layer %u row %u", full_layer, t);
                         goto fail;
                     }
@@ -2995,7 +3660,7 @@ static int session_prefill(unified_session_state *st,
                 }
                 g_dbg_decode_step = -1;
             } else {
-                if (!run_full_layer_prefill_gpu(full_layer, &st->model.layers[full_layer], &st->mf, &st->full_small_caches[ci], &st->full_states[ci], state_seq, seq_len)) {
+                if (!run_full_layer_prefill_gpu(full_layer, &st->gf, &st->model.layers[full_layer], &st->mf, &st->full_caches[ci], &st->full_small_caches[ci], &st->full_states[ci], state_seq, seq_len)) {
                     snprintf(err, err_cap, "gpu full prefill failed layer %u", full_layer);
                     goto fail;
                 }
@@ -3023,12 +3688,25 @@ static int session_prefill(unified_session_state *st,
             free(state_seq);
             state_seq = next_seq;
             next_seq = NULL;
+            if (seq_len > 0u) {
+                char boundary_label[32];
+                snprintf(boundary_label, sizeof(boundary_label), "POST_FULL%u_LAST", full_layer);
+                prefill_boundary_dbg_report_signature(ci,
+                                                      boundary_label,
+                                                      state_seq + (size_t)(seq_len - 1u) * hidden,
+                                                      hidden);
+            }
         }
 #endif
     }
     st->cycle_owned_seqs = (float **)calloc(st->cfg.n_cycles, sizeof(float *));
     if (!st->cycle_owned_seqs) {
         snprintf(err, err_cap, "oom cycle snapshot table");
+        goto fail;
+    }
+    st->cycle_owned_rows = (float **)calloc(st->cfg.n_cycles, sizeof(float *));
+    if (!st->cycle_owned_rows) {
+        snprintf(err, err_cap, "oom cycle row snapshot table");
         goto fail;
     }
     {
@@ -3040,6 +3718,15 @@ static int session_prefill(unified_session_state *st,
                 goto fail;
             }
             memcpy(st->cycle_owned_seqs[ci], st->full_states[ci].output_seq, cycle_bytes);
+            st->cycle_owned_rows[ci] = (float *)malloc((size_t)hidden * sizeof(float));
+            if (!st->cycle_owned_rows[ci]) {
+                snprintf(err, err_cap, "oom cycle row snapshot %u", ci);
+                goto fail;
+            }
+            memcpy(st->cycle_owned_rows[ci],
+                   st->full_states[ci].output_seq + (size_t)(seq_len - 1u) * hidden,
+                   (size_t)hidden * sizeof(float));
+            prefill_cycle_dbg_report_signature(st, ci, "POST_FULL_LAST", st->cycle_owned_rows[ci], hidden);
         }
     }
     st->owned_seq = state_seq;
@@ -3078,6 +3765,16 @@ fail:
         for (ci = 0; ci < st->cfg.n_cycles; ++ci) free(st->cycle_owned_seqs[ci]);
         free(st->cycle_owned_seqs);
         st->cycle_owned_seqs = NULL;
+    }
+    if (st->cycle_pre_full_rows) {
+        for (ci = 0; ci < st->cfg.n_cycles; ++ci) free(st->cycle_pre_full_rows[ci]);
+        free(st->cycle_pre_full_rows);
+        st->cycle_pre_full_rows = NULL;
+    }
+    if (st->cycle_owned_rows) {
+        for (ci = 0; ci < st->cfg.n_cycles; ++ci) free(st->cycle_owned_rows[ci]);
+        free(st->cycle_owned_rows);
+        st->cycle_owned_rows = NULL;
     }
     st->owned_seq = NULL;
     st->seq_len = 0;
@@ -3275,7 +3972,7 @@ static int session_step(unified_session_state *st, uint32_t token_id, char *err,
                         fprintf(stderr, "=== DBG_FULL_BC[%u] step=%u GPU_STEP_START\n", full_layer, (uint32_t)g_dbg_decode_step);
                         fflush(stderr);
                     }
-                    if (!run_full_layer_step_gpu(&st->model.layers[full_layer], &st->mf, &st->full_small_caches[ci], &st->full_states[ci], state_row, next_row)) {
+                    if (!run_full_layer_step_gpu(&st->gf, &st->model.layers[full_layer], full_layer, &st->mf, &st->full_caches[ci], &st->full_small_caches[ci], &st->full_states[ci], state_row, next_row)) {
                         snprintf(err, err_cap, "gpu full step failed layer %u", full_layer);
                         goto fail;
                     }
@@ -3480,7 +4177,7 @@ static void handle_dump_cycle_hidden(const unified_session_state *st, char *rest
         fflush(stdout);
         return;
     }
-    if (!st->prefilled || !st->cycle_owned_seqs || cycle_idx >= st->cfg.n_cycles || !st->cycle_owned_seqs[cycle_idx]) {
+    if (!st->prefilled || !st->full_states || cycle_idx >= st->cfg.n_cycles || !st->full_states[cycle_idx].output_seq) {
         printf("ERROR bad cycle hidden\n");
         fflush(stdout);
         return;
@@ -3489,7 +4186,7 @@ static void handle_dump_cycle_hidden(const unified_session_state *st, char *rest
     n_bytes = n * sizeof(float);
     printf("CYCLE_HIDDEN %u %zu %zu\n", cycle_idx, n, n_bytes);
     fflush(stdout);
-    (void)write_all(STDOUT_FILENO, st->cycle_owned_seqs[cycle_idx], n_bytes);
+    (void)write_all(STDOUT_FILENO, st->full_states[cycle_idx].output_seq, n_bytes);
 }
 
 static void handle_dump_cycle_pre_hidden(const unified_session_state *st, char *rest) {
@@ -3511,6 +4208,46 @@ static void handle_dump_cycle_pre_hidden(const unified_session_state *st, char *
     printf("CYCLE_PRE_HIDDEN %u %zu %zu\n", cycle_idx, n, n_bytes);
     fflush(stdout);
     (void)write_all(STDOUT_FILENO, st->cycle_pre_full_seqs[cycle_idx], n_bytes);
+}
+
+static void handle_dump_cycle_last(const unified_session_state *st, char *rest) {
+    uint32_t cycle_idx = 0;
+    const float *last = NULL;
+    size_t n_bytes = 0;
+    if (sscanf(rest ? rest : "", "%u", &cycle_idx) != 1) {
+        printf("ERROR bad DUMP_CYCLE_LAST args\n");
+        fflush(stdout);
+        return;
+    }
+    if (!st->prefilled || !st->full_states || cycle_idx >= st->cfg.n_cycles || !st->full_states[cycle_idx].output_seq || st->seq_len == 0) {
+        printf("ERROR bad cycle last\n");
+        fflush(stdout);
+        return;
+    }
+    last = st->full_states[cycle_idx].output_seq + (size_t)(st->seq_len - 1u) * st->hidden;
+    n_bytes = (size_t)st->hidden * sizeof(float);
+    printf("CYCLE_LAST %u %u %zu\n", cycle_idx, st->hidden, n_bytes);
+    fflush(stdout);
+    (void)write_all(STDOUT_FILENO, last, n_bytes);
+}
+
+static void handle_dump_cycle_pre_last(const unified_session_state *st, char *rest) {
+    uint32_t cycle_idx = 0;
+    size_t n_bytes = 0;
+    if (sscanf(rest ? rest : "", "%u", &cycle_idx) != 1) {
+        printf("ERROR bad DUMP_CYCLE_PRE_LAST args\n");
+        fflush(stdout);
+        return;
+    }
+    if (!st->prefilled || !st->cycle_pre_full_rows || cycle_idx >= st->cfg.n_cycles || !st->cycle_pre_full_rows[cycle_idx]) {
+        printf("ERROR bad cycle pre last\n");
+        fflush(stdout);
+        return;
+    }
+    n_bytes = (size_t)st->hidden * sizeof(float);
+    printf("CYCLE_PRE_LAST %u %u %zu\n", cycle_idx, st->hidden, n_bytes);
+    fflush(stdout);
+    (void)write_all(STDOUT_FILENO, st->cycle_pre_full_rows[cycle_idx], n_bytes);
 }
 
 static void handle_prefill_prefix_bin(unified_session_state *st, char *rest) {
@@ -3616,6 +4353,10 @@ int main(int argc, char **argv) {
             handle_dump_cycle_hidden(&st, strtok(NULL, ""));
         } else if (strcmp(cmd, "DUMP_CYCLE_PRE_HIDDEN") == 0) {
             handle_dump_cycle_pre_hidden(&st, strtok(NULL, ""));
+        } else if (strcmp(cmd, "DUMP_CYCLE_LAST") == 0) {
+            handle_dump_cycle_last(&st, strtok(NULL, ""));
+        } else if (strcmp(cmd, "DUMP_CYCLE_PRE_LAST") == 0) {
+            handle_dump_cycle_pre_last(&st, strtok(NULL, ""));
         } else if (strcmp(cmd, "DUMP_LAST") == 0) {
             handle_dump_last(&st);
         } else if (strcmp(cmd, "RESET") == 0) {

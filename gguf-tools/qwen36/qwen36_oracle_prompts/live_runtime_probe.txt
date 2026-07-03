@@ -1,0 +1,8 @@
+You are validating a narrow local runtime for a hybrid MoE model.
+
+Write a compact technical report with three sections:
+1. The most failure-prone part of live routed-expert inference.
+2. The minimum cache metrics needed to diagnose expert locality quality.
+3. A concrete plan to compare baseline vs patched decode on arbitrary prompts.
+
+Keep it precise and implementation-oriented.

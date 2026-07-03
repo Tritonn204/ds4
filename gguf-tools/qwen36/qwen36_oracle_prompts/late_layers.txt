@@ -1,0 +1,2 @@
+Late-layer note:
+Protecting the final few expert-down projections can matter disproportionately because

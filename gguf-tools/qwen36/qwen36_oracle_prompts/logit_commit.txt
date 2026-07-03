@@ -1,0 +1,2 @@
+Logit-commit note:
+Small activation errors near the end of the network can flip the chosen next token because

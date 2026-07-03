@@ -1,0 +1,10 @@
+Design a small C runtime subsystem for live MoE expert fetch.
+
+Requirements:
+- keyed by layer id and expert id
+- loads gate/up/down expert tensors on demand
+- caches decoded tensors in RAM
+- exposes hit/miss counters
+- does not assume SSD streaming
+
+Write a concrete design note with data structures, call flow, and the three most important failure modes.

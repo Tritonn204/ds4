@@ -13,6 +13,8 @@ The important pieces are:
   importance with `ds4`.
 - `quality-testing/`: prompts and scripts used to compare local GGUF variants
   against official DeepSeek V4 Flash continuations.
+- `qwen36/`: tracked Qwen3.6 study, oracle, fixture, and experimental export
+  tooling used for the narrow-runtime bringup.
 
 ## Build
 

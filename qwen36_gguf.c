@@ -356,10 +356,10 @@ const char *qwen36_gguf_type_name(uint32_t type) {
     case QWEN36_GGUF_TYPE_F32: return "f32";
     case QWEN36_GGUF_TYPE_F16: return "f16";
     case QWEN36_GGUF_TYPE_Q8_0: return "q8_0";
-    case 10: return "q2_k";
-    case 12: return "q4_k";
-    case 13: return "q5_k";
-    case 14: return "q6_k";
+    case QWEN36_GGUF_TYPE_Q2_K: return "q2_k";
+    case QWEN36_GGUF_TYPE_Q4_K: return "q4_k";
+    case QWEN36_GGUF_TYPE_Q5_K: return "q5_k";
+    case QWEN36_GGUF_TYPE_Q6_K: return "q6_k";
     case QWEN36_GGUF_TYPE_IQ2_XXS: return "iq2_xxs";
     case QWEN36_GGUF_TYPE_IQ3_S: return "iq3_s";
     case QWEN36_GGUF_TYPE_IQ2_S: return "iq2_s";

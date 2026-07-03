@@ -544,8 +544,8 @@ static int routed_moe_launch(
         const uint32_t gate_row_span = 1024u;
         const uint32_t down_row_span = 1024u;
         const uint32_t use_down_row2048 = !q4k_path && use_atomic_down && use_down_tile16;
-        const uint32_t use_direct_down_sum6 =
-            n_tokens == 1u && n_expert == 6u;
+        const uint32_t use_direct_down_sum =
+            n_tokens == 1u && n_expert <= DS4_ROCM_MAX_EXPERT_USED;
         uint32_t *sorted_pairs = NULL;
         uint32_t *sorted_offsets = NULL;
         uint32_t *sorted_counts = NULL;
@@ -1172,10 +1172,10 @@ static int routed_moe_launch(
                 down_tile_starts = tile16_starts;
                 down_tile_capacity = tile16_capacity;
             }
-            if (use_direct_down_sum6) {
+            if (use_direct_down_sum) {
                 dim3 sgrid((out_dim + 31u) / 32u, 1, 1);
                 if (q4k_path) {
-                    moe_down_q4K_sum6_qwarp32_kernel<<<sgrid, 256>>>(
+                    moe_down_q4K_sumN_qwarp32_kernel<<<sgrid, 256>>>(
                         (float *)out->ptr,
                         down_w,
                         midq,
@@ -1183,9 +1183,10 @@ static int routed_moe_launch(
                         down_expert_bytes,
                         down_row_bytes,
                         midq_blocks,
-                        out_dim);
+                        out_dim,
+                        n_expert);
                 } else {
-                    moe_down_sum6_qwarp32_kernel<<<sgrid, 256>>>(
+                    moe_down_sumN_qwarp32_kernel<<<sgrid, 256>>>(
                         (float *)out->ptr,
                         down_w,
                         midq,
@@ -1193,14 +1194,15 @@ static int routed_moe_launch(
                         down_expert_bytes,
                         down_row_bytes,
                         midq_blocks,
-                        out_dim);
+                        out_dim,
+                        n_expert);
                 }
             } else if (use_atomic_down) {
                 uint64_t n = (uint64_t)n_tokens * out_dim;
                 zero_kernel<<<(n + 255u) / 256u, 256>>>((float *)out->ptr, n);
                 ok = cuda_ok(cudaGetLastError(), "routed_moe atomic zero launch");
             }
-            if (use_direct_down_sum6) {
+            if (use_direct_down_sum) {
                 /* The direct decode kernel writes the final token row. */
             } else if (sorted_pairs && use_expert_tiles && sorted_offsets && sorted_counts &&
                 down_tile_total && down_tile_experts && down_tile_starts) {
@@ -1332,7 +1334,7 @@ static int routed_moe_launch(
             ok = cuda_ok(cudaGetLastError(), "routed_moe down launch");
             }
         }
-        if (ok && !use_atomic_down && !use_direct_down_sum6 && !use_iq2_q2_float_down) {
+        if (ok && !use_atomic_down && !use_direct_down_sum && !use_iq2_q2_float_down) {
             uint64_t n = (uint64_t)n_tokens * out_dim;
             moe_sum_kernel<<<(n + 255) / 256, 256>>>((float *)out->ptr, (const float *)down->ptr, out_dim, n_expert, n_tokens);
             ok = cuda_ok(cudaGetLastError(), "routed_moe sum launch");

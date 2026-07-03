@@ -460,13 +460,13 @@ qwen36-live-contract-worker: qwen36_live_contract_worker.o qwen36_35a3b_q8.o qwe
 qwen36-owned-session-worker: qwen36_owned_session_worker.o
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
 
-qwen36-unified-owned-worker: qwen36_unified_owned_worker.o qwen36_35a3b_q8.o qwen36_gguf.o
+qwen36-unified-owned-worker: qwen36_unified_owned_worker.o qwen36_35a3b_q8.o qwen36_35a3b_q4xl.o qwen36_gguf.o
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
 
 qwen36_unified_owned_worker_gpu.o: qwen36_unified_owned_worker.c qwen36_unified_full_gpu.inc
 	$(CC) $(CFLAGS) -DQWEN36_UNIFIED_HAVE_GPU -DDS4_ROCM_BUILD -c -o $@ qwen36_unified_owned_worker.c
 
-qwen36-unified-owned-worker-rocm: qwen36_unified_owned_worker_gpu.o qwen36_35a3b_q8.o qwen36_gguf.o ds4.o ds4_distributed.o ds4_ssd.o ds4_rocm.o
+qwen36-unified-owned-worker-rocm: qwen36_unified_owned_worker_gpu.o qwen36_35a3b_q8.o qwen36_35a3b_q4xl.o qwen36_gguf.o ds4.o ds4_distributed.o ds4_ssd.o ds4_rocm.o
 	$(HIPCC) $(ROCM_CFLAGS) -o $@ $^ $(ROCM_LDLIBS)
 
 qwen36-fixture-blk0-worker: qwen36_fixture_blk0_worker.o qwen36_35a3b_q8.o qwen36_gguf.o
@@ -496,7 +496,7 @@ qwen36-gpu-prefix-q8-chain-dynamic: qwen36_gpu_blk0_dynamic_q8_oracle.o qwen36_3
 qwen36-gpu-full-layer-q8-dynamic: qwen36_gpu_full_layer_q8_dynamic.o qwen36_35a3b_q8.o qwen36_gguf.o ds4.o ds4_distributed.o ds4_ssd.o ds4_rocm.o
 	$(HIPCC) $(ROCM_CFLAGS) -o $@ $^ $(ROCM_LDLIBS)
 
-qwen36-gpu-full-layer-worker: qwen36_gpu_full_layer_worker.o qwen36_35a3b_q8.o qwen36_gguf.o ds4.o ds4_distributed.o ds4_ssd.o ds4_rocm.o
+qwen36-gpu-full-layer-worker: qwen36_gpu_full_layer_worker.o qwen36_35a3b_q8.o qwen36_35a3b_q4xl.o qwen36_gguf.o ds4.o ds4_distributed.o ds4_ssd.o ds4_rocm.o
 	$(HIPCC) $(ROCM_CFLAGS) -o $@ $^ $(ROCM_LDLIBS)
 
 ds4_metal.o: ds4_metal.m ds4_gpu.h $(METAL_SRCS)

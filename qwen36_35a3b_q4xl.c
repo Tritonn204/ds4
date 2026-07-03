@@ -110,6 +110,14 @@ static bool expect_named_tensor(const qwen36_gguf_file *gf, const qwen36_35a3b_q
     return tensor_matches(qwen36_gguf_find_tensor(gf, e->name), e, err, err_cap);
 }
 
+static bool tensor_type_in(uint32_t got, const uint32_t *types, size_t count) {
+    size_t i;
+    for (i = 0; i < count; i++) {
+        if (got == types[i]) return true;
+    }
+    return false;
+}
+
 static void layer_name(char *buf, size_t cap, uint32_t layer, const char *suffix) {
     snprintf(buf, cap, "blk.%u.%s", layer, suffix);
 }
@@ -150,6 +158,43 @@ static uint32_t expect_ffn_down_type(uint32_t layer) {
     default:
         return QWEN36_GGUF_TYPE_Q5_K;
     }
+}
+
+static bool expect_ffn_down_tensor(const qwen36_gguf_file *gf, uint32_t layer,
+                                   const qwen36_gguf_tensor **out, char *err, size_t err_cap) {
+    static const uint32_t allowed[] = {
+        QWEN36_GGUF_TYPE_Q4_K,
+        QWEN36_GGUF_TYPE_Q5_K,
+        QWEN36_GGUF_TYPE_Q6_K,
+    };
+    char name[128];
+    const qwen36_gguf_tensor *t;
+    layer_name(name, sizeof(name), layer, "ffn_down_exps.weight");
+    t = qwen36_gguf_find_tensor(gf, name);
+    if (!t) {
+        set_err(err, err_cap, "missing tensor %s", name);
+        return false;
+    }
+    if (t->ndim != 3 || t->dims[0] != 512 || t->dims[1] != 2048 || t->dims[2] != 256) {
+        set_err(err, err_cap,
+                "tensor %s mismatch: got type=%s ndim=%u dims=[%llu,%llu,%llu] expected ndim=%u dims=[%u,%u,%u]",
+                name,
+                qwen36_gguf_type_name(t->type),
+                t->ndim,
+                (unsigned long long)t->dims[0],
+                (unsigned long long)t->dims[1],
+                (unsigned long long)t->dims[2],
+                3u, 512u, 2048u, 256u);
+        return false;
+    }
+    if (!tensor_type_in(t->type, allowed, sizeof(allowed) / sizeof(allowed[0]))) {
+        set_err(err, err_cap,
+                "tensor %s mismatch: got type=%s expected one of {q4_k,q5_k,q6_k}",
+                name, qwen36_gguf_type_name(t->type));
+        return false;
+    }
+    *out = t;
+    return true;
 }
 
 static bool validate_metadata(const qwen36_gguf_file *gf, char *err, size_t err_cap) {
@@ -198,8 +243,6 @@ static bool bind_layer(const qwen36_gguf_file *gf, uint32_t i, qwen36_35a3b_q4xl
     bool has_hybrid = tensor_exists(gf, i, "attn_qkv.weight");
     bool has_full = tensor_exists(gf, i, "attn_q.weight");
     uint32_t gate_up_type = expect_ffn_gate_up_type(i);
-    uint32_t down_type = expect_ffn_down_type(i);
-
     memset(l, 0, sizeof(*l));
     if (!expect_layer_tensor(gf, i, "attn_norm.weight", QWEN36_GGUF_TYPE_F32, 1, 2048, 0, 0, &l->attn_norm, err, err_cap)) return false;
     if (!expect_layer_tensor(gf, i, "post_attention_norm.weight", QWEN36_GGUF_TYPE_F32, 1, 2048, 0, 0, &l->post_attn_norm, err, err_cap)) return false;
@@ -207,7 +250,7 @@ static bool bind_layer(const qwen36_gguf_file *gf, uint32_t i, qwen36_35a3b_q4xl
     if (!expect_layer_tensor(gf, i, "ffn_gate_inp_shexp.weight", QWEN36_GGUF_TYPE_F32, 1, 2048, 0, 0, &l->ffn_gate_inp_shexp, err, err_cap)) return false;
     if (!expect_layer_tensor(gf, i, "ffn_gate_exps.weight", gate_up_type, 3, 2048, 512, 256, &l->ffn_gate_exps, err, err_cap)) return false;
     if (!expect_layer_tensor(gf, i, "ffn_up_exps.weight", gate_up_type, 3, 2048, 512, 256, &l->ffn_up_exps, err, err_cap)) return false;
-    if (!expect_layer_tensor(gf, i, "ffn_down_exps.weight", down_type, 3, 512, 2048, 256, &l->ffn_down_exps, err, err_cap)) return false;
+    if (!expect_ffn_down_tensor(gf, i, &l->ffn_down_exps, err, err_cap)) return false;
     if (!expect_layer_tensor(gf, i, "ffn_gate_shexp.weight", QWEN36_GGUF_TYPE_Q8_0, 2, 2048, 512, 0, &l->ffn_gate_shexp, err, err_cap)) return false;
     if (!expect_layer_tensor(gf, i, "ffn_up_shexp.weight", QWEN36_GGUF_TYPE_Q8_0, 2, 2048, 512, 0, &l->ffn_up_shexp, err, err_cap)) return false;
     if (!expect_layer_tensor(gf, i, "ffn_down_shexp.weight", QWEN36_GGUF_TYPE_Q8_0, 2, 512, 2048, 0, &l->ffn_down_shexp, err, err_cap)) return false;

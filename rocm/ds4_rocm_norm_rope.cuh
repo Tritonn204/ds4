@@ -327,6 +327,60 @@ __global__ static void rope_tail_kernel(
     tail[i + 1] = x0 * s + x1 * c;
 }
 
+__global__ static void rope_tail_split_half_kernel(
+        float *x,
+        uint32_t n_tok,
+        uint32_t n_head,
+        uint32_t head_dim,
+        uint32_t n_rot,
+        uint32_t pos0,
+        uint32_t pos_stride,
+        uint32_t n_ctx_orig,
+        int inverse,
+        float freq_base,
+        float freq_scale,
+        float ext_factor,
+        float attn_factor,
+        float beta_fast,
+        float beta_slow) {
+    uint32_t gid = blockIdx.x * blockDim.x + threadIdx.x;
+    uint32_t half_rot = n_rot / 2u;
+    uint32_t pairs = n_tok * n_head * half_rot;
+    if (gid >= pairs) return;
+    uint32_t pair = gid % half_rot;
+    uint32_t tmp = gid / half_rot;
+    uint32_t h = tmp % n_head;
+    uint32_t t = tmp / n_head;
+    float corr0 = 0.0f, corr1 = 0.0f;
+    if (ext_factor != 0.0f) {
+        float denom = 2.0f * logf(freq_base);
+        corr0 = floorf((float)n_rot * logf((float)n_ctx_orig / (beta_fast * 2.0f * (float)M_PI)) / denom);
+        corr1 = ceilf((float)n_rot * logf((float)n_ctx_orig / (beta_slow * 2.0f * (float)M_PI)) / denom);
+        corr0 = fmaxf(0.0f, corr0);
+        corr1 = fminf((float)(n_rot - 1), corr1);
+    }
+
+    const float theta_scale = powf(freq_base, -2.0f / (float)n_rot);
+    float theta_extrap = (float)(pos0 + t * pos_stride) * powf(theta_scale, (float)pair);
+    float theta_interp = freq_scale * theta_extrap;
+    float theta = theta_interp;
+    float mscale = attn_factor;
+    if (ext_factor != 0.0f) {
+        float ramp_mix = rope_yarn_ramp_dev(corr0, corr1, (int)pair) * ext_factor;
+        theta = theta_interp * (1.0f - ramp_mix) + theta_extrap * ramp_mix;
+        mscale *= 1.0f + 0.1f * logf(1.0f / freq_scale);
+    }
+    float c = cosf(theta) * mscale;
+    float s = sinf(theta) * mscale;
+    if (inverse) s = -s;
+
+    float *row = x + ((uint64_t)t * n_head + h) * head_dim;
+    float x0 = row[pair];
+    float x1 = row[pair + half_rot];
+    row[pair] = x0 * c - x1 * s;
+    row[pair + half_rot] = x0 * s + x1 * c;
+}
+
 __device__ static float dsv4_e4m3fn_value_dev(int i) {
     int exp = (i >> 3) & 15;
     int mant = i & 7;
@@ -624,4 +678,13 @@ static int cuda_rope_tail_stride_tensor(ds4_gpu_tensor *x, uint32_t n_tok, uint3
 
 extern "C" int ds4_gpu_rope_tail_tensor(ds4_gpu_tensor *x, uint32_t n_tok, uint32_t n_head, uint32_t head_dim, uint32_t n_rot, uint32_t pos0, uint32_t n_ctx_orig, bool inverse, float freq_base, float freq_scale, float ext_factor, float attn_factor, float beta_fast, float beta_slow) {
     return cuda_rope_tail_stride_tensor(x, n_tok, n_head, head_dim, n_rot, pos0, 1u, n_ctx_orig, inverse, freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow);
+}
+
+extern "C" int ds4_gpu_rope_tail_split_half_tensor(ds4_gpu_tensor *x, uint32_t n_tok, uint32_t n_head, uint32_t head_dim, uint32_t n_rot, uint32_t pos0, uint32_t n_ctx_orig, bool inverse, float freq_base, float freq_scale, float ext_factor, float attn_factor, float beta_fast, float beta_slow) {
+    if (!x || n_rot > head_dim || (n_rot & 1u) || x->bytes < (uint64_t)n_tok * n_head * head_dim * sizeof(float)) return 0;
+    uint32_t pairs = n_tok * n_head * (n_rot / 2u);
+    rope_tail_split_half_kernel<<<(pairs + 255u) / 256u, 256>>>(
+        (float *)x->ptr, n_tok, n_head, head_dim, n_rot, pos0, 1u, n_ctx_orig,
+        inverse ? 1 : 0, freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow);
+    return cuda_ok(cudaGetLastError(), "rope_tail_split_half launch");
 }

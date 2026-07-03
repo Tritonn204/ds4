@@ -1,4 +1,5 @@
 #include "ds4_gpu.h"
+#include "qwen36_35a3b_q4xl.h"
 #include "qwen36_35a3b_q8.h"
 
 #include <errno.h>
@@ -23,6 +24,71 @@
 #define ATTN_GATE_DIM (NUM_HEADS * HEAD_DIM)
 #define QWEN_RMS_EPS 1e-6f
 #define QWEN_SWIGLU_CLAMP 80.0f
+#define QK_K 256
+#define K_SCALE_SIZE 12
+
+typedef struct {
+    uint16_t d;
+    uint16_t dmin;
+    uint8_t scales[K_SCALE_SIZE];
+    uint8_t qs[QK_K / 2];
+} qwen36_block_q4_K;
+
+typedef struct {
+    uint16_t d;
+    uint16_t dmin;
+    uint8_t scales[K_SCALE_SIZE];
+    uint8_t qh[QK_K / 8];
+    uint8_t qs[QK_K / 2];
+} qwen36_block_q5_K;
+
+typedef struct {
+    uint8_t ql[QK_K / 2];
+    uint8_t qh[QK_K / 4];
+    int8_t scales[QK_K / 16];
+    uint16_t d;
+} qwen36_block_q6_K;
+
+typedef struct qwen36_contract_layer {
+    int kind;
+    const qwen36_gguf_tensor *attn_norm;
+    const qwen36_gguf_tensor *post_attn_norm;
+    const qwen36_gguf_tensor *attn_gate;
+    const qwen36_gguf_tensor *attn_qkv;
+    const qwen36_gguf_tensor *attn_q;
+    const qwen36_gguf_tensor *attn_q_norm;
+    const qwen36_gguf_tensor *attn_k;
+    const qwen36_gguf_tensor *attn_k_norm;
+    const qwen36_gguf_tensor *attn_v;
+    const qwen36_gguf_tensor *attn_output;
+    const qwen36_gguf_tensor *ssm_a;
+    const qwen36_gguf_tensor *ssm_alpha;
+    const qwen36_gguf_tensor *ssm_beta;
+    const qwen36_gguf_tensor *ssm_conv1d;
+    const qwen36_gguf_tensor *ssm_dt_bias;
+    const qwen36_gguf_tensor *ssm_norm;
+    const qwen36_gguf_tensor *ssm_out;
+    const qwen36_gguf_tensor *ffn_gate_inp;
+    const qwen36_gguf_tensor *ffn_gate_inp_shexp;
+    const qwen36_gguf_tensor *ffn_gate_exps;
+    const qwen36_gguf_tensor *ffn_up_exps;
+    const qwen36_gguf_tensor *ffn_down_exps;
+    const qwen36_gguf_tensor *ffn_gate_shexp;
+    const qwen36_gguf_tensor *ffn_up_shexp;
+    const qwen36_gguf_tensor *ffn_down_shexp;
+} qwen36_contract_layer;
+
+#define QWEN36_CONTRACT_LAYER_KIND_FULL_ATTENTION 2
+
+typedef struct qwen36_contract_model {
+    const qwen36_gguf_file *gf;
+    const qwen36_gguf_tensor *token_embd;
+    const qwen36_gguf_tensor *output_norm;
+    const qwen36_gguf_tensor *output;
+    qwen36_contract_layer layers[QWEN36_35A3B_Q8_BLOCK_COUNT];
+    uint32_t hybrid_layer_count;
+    uint32_t full_attn_layer_count;
+} qwen36_contract_model;
 
 typedef struct mapped_file {
     int fd;
@@ -38,8 +104,8 @@ typedef struct full_layer_small_cache {
 
 typedef struct worker_state {
     qwen36_gguf_file gf;
-    qwen36_35a3b_q8_model q8;
-    const qwen36_35a3b_q8_layer *layer;
+    qwen36_contract_model model;
+    const qwen36_contract_layer *layer;
     uint32_t layer_idx;
     mapped_file mf;
     full_layer_small_cache cache;
@@ -60,6 +126,52 @@ typedef struct full_ffn_timing {
     double combine_ms;
     uint32_t n_union;
 } full_ffn_timing;
+
+static void q4_k_get_scale_min(int j, const uint8_t *q, uint8_t *sc, uint8_t *m) {
+    if (j < 4) {
+        *sc = q[j] & 63;
+        *m = q[j + 4] & 63;
+    } else {
+        *sc = (q[j + 4] & 0xF) | ((q[j - 4] >> 6) << 4);
+        *m = (q[j + 4] >> 4) | ((q[j - 0] >> 6) << 4);
+    }
+}
+
+static void map_q8_contract_layer(qwen36_contract_layer *dst, const qwen36_35a3b_q8_layer *src) {
+    memcpy(dst, src, sizeof(*dst));
+}
+
+static void map_q4xl_contract_layer(qwen36_contract_layer *dst, const qwen36_35a3b_q4xl_layer *src) {
+    memcpy(dst, src, sizeof(*dst));
+}
+
+static int bind_contract_model(const qwen36_gguf_file *gf, qwen36_contract_model *out, char *err, size_t err_cap) {
+    qwen36_35a3b_q8_model q8;
+    qwen36_35a3b_q4xl_model q4;
+    uint32_t i;
+    memset(out, 0, sizeof(*out));
+    if (qwen36_35a3b_q8_bind(gf, &q8, err, err_cap)) {
+        out->gf = q8.gf;
+        out->token_embd = q8.token_embd;
+        out->output_norm = q8.output_norm;
+        out->output = q8.output;
+        out->hybrid_layer_count = q8.hybrid_layer_count;
+        out->full_attn_layer_count = q8.full_attn_layer_count;
+        for (i = 0; i < QWEN36_35A3B_Q8_BLOCK_COUNT; ++i) map_q8_contract_layer(&out->layers[i], &q8.layers[i]);
+        return 1;
+    }
+    if (qwen36_35a3b_q4xl_bind(gf, &q4, err, err_cap)) {
+        out->gf = q4.gf;
+        out->token_embd = q4.token_embd;
+        out->output_norm = q4.output_norm;
+        out->output = q4.output;
+        out->hybrid_layer_count = q4.hybrid_layer_count;
+        out->full_attn_layer_count = q4.full_attn_layer_count;
+        for (i = 0; i < QWEN36_35A3B_Q4XL_BLOCK_COUNT; ++i) map_q4xl_contract_layer(&out->layers[i], &q4.layers[i]);
+        return 1;
+    }
+    return 0;
+}
 
 static double now_ms(void) {
     struct timespec ts;
@@ -136,7 +248,7 @@ static void free_small_cache(full_layer_small_cache *cache) {
     memset(cache, 0, sizeof(*cache));
 }
 
-static int load_small_cache(const qwen36_gguf_file *gf, const qwen36_35a3b_q8_layer *layer, full_layer_small_cache *cache, char *err, size_t err_cap) {
+static int load_small_cache(const qwen36_gguf_file *gf, const qwen36_contract_layer *layer, full_layer_small_cache *cache, char *err, size_t err_cap) {
     memset(cache, 0, sizeof(*cache));
     if (!read_f32_tensor(gf, layer->attn_q_norm, &cache->q_norm_w, HEAD_DIM, err, err_cap)) return 0;
     if (!read_f32_tensor(gf, layer->attn_k_norm, &cache->k_norm_w, HEAD_DIM, err, err_cap)) return 0;
@@ -155,8 +267,19 @@ static inline float sigmoidf_local(float x) {
     }
 }
 
-static uint64_t q8_row_bytes(uint32_t cols) {
-    return (uint64_t)(cols / 32u) * 34u;
+static uint64_t tensor_row_bytes(const qwen36_gguf_tensor *t, uint32_t cols) {
+    switch (t->type) {
+    case QWEN36_GGUF_TYPE_Q8_0:
+        return (uint64_t)(cols / 32u) * 34u;
+    case QWEN36_GGUF_TYPE_Q4_K:
+        return (uint64_t)(cols / QK_K) * sizeof(qwen36_block_q4_K);
+    case QWEN36_GGUF_TYPE_Q5_K:
+        return (uint64_t)(cols / QK_K) * sizeof(qwen36_block_q5_K);
+    case QWEN36_GGUF_TYPE_Q6_K:
+        return (uint64_t)(cols / QK_K) * sizeof(qwen36_block_q6_K);
+    default:
+        return 0;
+    }
 }
 
 static void topk_softmax256(const float *logits, uint32_t k, int32_t *idx, float *scores) {
@@ -240,7 +363,7 @@ static void rmsnorm_weight_raw(const float *in, float *out, const float *w, uint
 
 static int run_gpu_ffn_from_residual(
         const mapped_file *mf,
-        const qwen36_35a3b_q8_layer *layer,
+        const qwen36_contract_layer *layer,
         const float *shared_gate_inp_w,
         uint32_t n_tokens,
         const float *residual_in,
@@ -252,9 +375,9 @@ static int run_gpu_ffn_from_residual(
     const uint64_t seq_hidden_bytes = (uint64_t)n_tokens * hidden * sizeof(float);
     const uint64_t router_logits_bytes = (uint64_t)n_tokens * ROUTER_COUNT * sizeof(float);
     const uint64_t shared_bytes = (uint64_t)n_tokens * shared_dim * sizeof(float);
-    const uint64_t gate_row_bytes = q8_row_bytes(hidden);
+    const uint64_t gate_row_bytes = tensor_row_bytes(layer->ffn_gate_exps, hidden);
     const uint64_t gate_expert_bytes = gate_row_bytes * INTER;
-    const uint64_t down_row_bytes = q8_row_bytes(INTER);
+    const uint64_t down_row_bytes = tensor_row_bytes(layer->ffn_down_exps, INTER);
     const uint64_t down_expert_bytes = down_row_bytes * hidden;
     ds4_gpu_tensor *residual = NULL, *post = NULL, *router_logits = NULL;
     ds4_gpu_tensor *shared_gate = NULL, *shared_up = NULL, *shared_mid = NULL, *shared_out = NULL;
@@ -921,7 +1044,7 @@ int main(int argc, char **argv) {
         fprintf(stderr, "%s\n", err);
         return 1;
     }
-    if (!qwen36_35a3b_q8_bind(&ws.gf, &ws.q8, err, sizeof(err))) {
+    if (!bind_contract_model(&ws.gf, &ws.model, err, sizeof(err))) {
         fprintf(stderr, "%s\n", err);
         qwen36_gguf_close(&ws.gf);
         return 1;
@@ -931,8 +1054,8 @@ int main(int argc, char **argv) {
         qwen36_gguf_close(&ws.gf);
         return 1;
     }
-    ws.layer = &ws.q8.layers[ws.layer_idx];
-    if (ws.layer->kind != QWEN36_LAYER_KIND_FULL_ATTENTION) {
+    ws.layer = &ws.model.layers[ws.layer_idx];
+    if (ws.layer->kind != QWEN36_CONTRACT_LAYER_KIND_FULL_ATTENTION) {
         fprintf(stderr, "layer %u is not full attention\n", ws.layer_idx);
         qwen36_gguf_close(&ws.gf);
         return 1;

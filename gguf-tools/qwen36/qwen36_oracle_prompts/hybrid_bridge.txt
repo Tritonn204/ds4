@@ -1,0 +1,2 @@
+Hybrid block note:
+Quantization damage compounds fastest when the attention-SSM bridge path is unstable because

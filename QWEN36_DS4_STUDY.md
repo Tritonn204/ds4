@@ -26,11 +26,11 @@ What changed:
 Current standalone full-layer prefill isolation result:
 
 - harness:
-  - `misc/qwen36_full_layer_prefill_isolation.py`
+  - `gguf-tools/qwen36/qwen36_full_layer_prefill_isolation.py`
 - worker:
   - `qwen36-gpu-full-layer-worker`
 - prompt:
-  - `misc/qwen36_oracle_prompts/code_review.txt`
+  - `gguf-tools/qwen36/qwen36_oracle_prompts/code_review.txt`
 - observed `seq_rmse` after the fix:
   - `blk.3 ~= 0.0061`
   - `blk.7 ~= 0.0089`
@@ -46,7 +46,7 @@ Interpretation:
 Current integrated owned-session prefill result:
 
 - harness:
-  - `misc/qwen36_power2_owned_session_validator.py`
+  - `gguf-tools/qwen36/qwen36_power2_owned_session_validator.py`
 - owned-session configuration:
   - repo-truth ownership pattern
   - for every 4 layers: 3 hybrid, 1 full
@@ -106,7 +106,7 @@ Interpretation:
 Important later update from the owned-depth validator:
 
 - harness:
-  - `misc/qwen36_power2_owned_session_validator.py`
+  - `gguf-tools/qwen36/qwen36_power2_owned_session_validator.py`
 - this validator now uses repo-truth ownership:
   - for every 4 layers: 3 hybrid, 1 full
 - with the standalone full-layer raw-weight RMSNorm correction in place, behavior at the splice boundary is materially healthier than the older study state implied:
@@ -150,7 +150,7 @@ Full-layer decode scratch reuse has now also cleared the behavior gate:
 
 - full-layer persistent scratch had previously looked promising in narrow splice checks but had not yet been trusted for long decode behavior
 - a dedicated four-way study was added:
-  - `misc/qwen36_full_layer_opt_study.py`
+  - `gguf-tools/qwen36/qwen36_full_layer_opt_study.py`
   - cases:
     - `baseline`
     - `batched_only`
@@ -204,7 +204,7 @@ Second attempt: persistent incremental GPU KV row writes
   - GPU cache becomes persistent across decode steps
   - per-token bandwidth shifts from full-prefix replay to row append semantics
 
-Focused correctness result from `misc/qwen36_full_attn_decode_study.py`:
+Focused correctness result from `gguf-tools/qwen36/qwen36_full_attn_decode_study.py`:
 
 - previous worst focused full-attention stage:
   - `step=20`
@@ -219,6 +219,857 @@ Focused correctness result from `misc/qwen36_full_attn_decode_study.py`:
   - `stage=K_CUR`
   - `rmse ~= 0.01249349`
 
+## July 1, 2026 Qwen upper-contract plan
+
+The next Qwen quant study should stop pretending the meaningful question is
+"all-Q4 versus all-Q8".
+
+That is not how the repo evidence is shaped and it is not how the existing
+Qwen mixed exports are structured.
+
+The right question is:
+
+- what is the strongest routed-expert compression surface we can take
+- while keeping the always-touched resident path protected
+- and while staying reproducible from local HF safetensors rather than from a
+  black-box prebuilt GGUF
+
+Oracle rule for this study:
+
+- do not re-export live fixtures by default
+- use:
+  - `gguf-tools/qwen36/qwen36_q4xl_oracle.py --mode routed` for direct routed-expert GGUF-vs-GGUF checks
+  - `gguf-tools/qwen36/qwen36_q4xl_oracle.py --mode fixtures` for cached hybrid live-fixture checks
+- fixture mode is now cache-first:
+  - it compares existing fixture caches
+  - it only exports when explicitly asked with `--export-missing` or `--rebuild`
+
+### July 1, 2026 Q4XL promotion decision
+
+We now have enough evidence to promote `UD_Q4_K_XL` from a side control to the
+official upper-bound contract for the next runtime phase.
+
+Evidence:
+
+1. Direct routed-expert GGUF oracle
+
+- harness:
+  - `gguf-tools/qwen36/qwen36_q4xl_routed_oracle.py`
+- sampled result:
+  - `blk.1` gate/up: `Q5_K`
+  - `blk.1` down: `Q6_K`
+  - `blk.38/39` gate/up: `Q4_K`
+  - `blk.38/39` down: `Q6_K`
+- sampled worst expert delta:
+  - `layer=39`
+  - `suffix=ffn_gate_exps.weight`
+  - `expert=42`
+  - `rmse ~= 0.00095492`
+
+Interpretation:
+
+- the intrinsic routed-expert weight drift from `Q8_0 -> Q4XL` is tiny
+- it is far smaller than the activation/runtime drift budget already tolerated
+  in the mixed narrow runtime
+
+2. External behavior oracle, long prompt, long continuation
+
+- harness:
+  - `gguf-tools/qwen36/qwen36_oracle_compare.py`
+- prompt:
+  - `gguf-tools/qwen36/qwen36_oracle_prompts/code_review.txt`
+- length:
+  - `n_predict = 196`
+- result:
+  - tokenization equal
+  - same-token prefix: `11`
+  - first greedy mismatch: step `11`
+  - raw token agreement rate: `0.061`
+  - reference-path `avg_nll ~= 0.363749`
+  - reference-path `perplexity_like ~= 1.438713`
+  - reference-path `same_argmax_rate ~= 0.954`
+
+Interpretation:
+
+- greedy text branches early, but the lower-bit model still strongly supports
+  the `Q8_0` path
+- the outputs remain semantically aligned on a nontrivial systems/programming
+  prompt
+- for practical study purposes, `Q4XL` is now considered behaviorally strong
+  enough to justify full narrow-runtime support work
+
+3. Size economics
+
+- local artifact sizes:
+  - `Q8_0 ~= 36.9 GB`
+  - `Q4XL ~= 22.4 GB`
+  - `DS4Style-v0 ~= 10.8 GB`
+- relative to `Q8_0`:
+  - `Q4XL` is about `60.6%` of size
+  - reduction is about `39.4%`
+- relative to `Q4XL`:
+  - `DS4Style-v0` is about `48.5%` of size
+
+Interpretation:
+
+- `Q4XL` is not the final DS4-style destination
+- it is the right bridge contract:
+  - much smaller than `Q8_0`
+  - materially safer than jumping directly to `DS4Style-v0`
+  - already compatible with the repo runtime-plan layer
+
+### Updated contract ladder
+
+For the next phase, treat the contracts as:
+
+1. `Q8_0`
+
+- structural/runtime oracle
+- current working narrow-runtime baseline
+
+2. `UD_Q4_K_XL`
+
+- promoted upper-bound runtime target
+- next contract to support end-to-end in the narrow runtime
+
+3. `DS4Style-v0`
+
+- aggressive follow-on contract
+- keep as the compression end-state candidate after `Q4XL` support lands
+
+### July 2, 2026 Bridge-Cleanup Lane Clarification
+
+Do not conflate the active `Q4` bridge cleanup work with the separate
+`DS4Style-v0` destination lane.
+
+There are two distinct artifact tracks:
+
+1. `Q4+Q2` bridge cleanup
+
+- start from the already-validated `Q4XL`-family bridge
+- preserve the routed tensors already proven safe at `Q2`-class
+- crush only the remaining routed `Q5_K/Q6_K` stragglers down to `Q4_K`
+- goal:
+  - make the upper-bound bridge contract more uniformly `Q4`
+  - reduce special-case runtime handling
+  - align better with DS4-style infra expectations
+
+2. `DS4Style-v0`
+
+- much more aggressive end-state contract
+- routed `gate/up` remain `IQ2_XXS`
+- routed `down` remains `IQ2_S` / `IQ3_S`
+- goal:
+  - validate the true `~10.8 GB` destination lane
+
+Interpretation:
+
+- the active cleanup lane is **not** "re-validate `Q8+Q2`"
+- the active cleanup lane is **not** "prove `DS4Style-v0`"
+- the active cleanup lane **is**:
+  - take the validated `Q4+Q2` bridge
+  - remove its remaining routed `Q5/Q6` stragglers where evidence says `Q4`
+    is still safe
+
+### Immediate next steps
+
+Do both tracks, but in this order:
+
+1. Runtime support for `Q4XL`
+
+- replace hardcoded `decode_q8_rows(...)` worker paths with generic typed row
+  decode dispatch
+- first targets:
+  - `qwen36_unified_owned_worker.c`
+  - `qwen36_live_contract_worker.c`
+  - `qwen36_c_prefix_q8_chain_live.c`
+  - `qwen36_c_full_layer_q8_dynamic.c`
+- goal:
+  - run the current narrow runtime directly on `Q4_K/Q5_K/Q6_K` routed tensors
+
+Current status:
+
+- the primary ROCm owned-session path now builds with:
+  - generic contract binding (`Q8_0` or `Q4XL`)
+  - generic CPU row decode for:
+    - `Q8_0`
+    - `Q4_K`
+    - `Q5_K`
+    - `Q6_K`
+- binary:
+  - `qwen36-unified-owned-worker-rocm`
+- this is the first real end-to-end runtime bridge for `Q4XL`
+- follow-up validation should start here before broadening support to the older
+  side workers
+- intermediate artifact cleanup target:
+  - `validated Q4+Q2 bridge`
+  - `-> Q4+Q2 with routed Q5/Q6 stragglers crushed to Q4`
+
+2. Reuse cached fixtures and oracle flow
+
+- do not re-export by default
+- keep using:
+  - `gguf-tools/qwen36/qwen36_q4xl_oracle.py --mode routed`
+  - `gguf-tools/qwen36/qwen36_q4xl_oracle.py --mode fixtures`
+
+3. After `Q4XL` runtime support lands, re-run the standard studies
+
+- behavior oracle
+- focused RMSE studies
+- throughput/time-per-token checks
+
+4. Keep `DS4Style-v0` alive in parallel as the aggressive lane
+
+- do not stop studying it
+- but do not block runtime progress on it
+- `Q4XL` is now the execution bridge, `DS4Style-v0` remains the destination
+
+### Contract decision
+
+There are now two distinct contracts to treat as first-class study artifacts:
+
+1. `Qwen3.6-35B-A3B-UD-Q4_K_XL`
+
+- role:
+  - empirical upper-bound control
+- source:
+  - existing downloaded GGUF
+- interpretation:
+  - tells us what a stable routed-expert-first mixed export already looks like
+- key shape:
+  - routed expert `gate/up` lowered first
+  - routed expert `down` kept one notch safer
+  - dense/shared/attention path mostly protected
+
+2. `Qwen3.6-35B-A3B-DS4Style-v0`
+
+- role:
+  - locally reproducible aggressive candidate
+- source:
+  - regenerated from:
+    - local HF safetensors
+    - local `Q8_0` template GGUF
+    - local DS4 quant backend
+- policy:
+  - `token_embd.weight`, `output.weight` -> `q4_k`
+  - resident load-bearing path -> `f32` / `q5_k` / `q6_k`
+  - routed `gate/up` -> `iq2_xxs`
+  - routed `down` main body -> `iq2_s`
+  - routed `down` late tail -> `iq3_s`
+
+This means:
+
+- `UD_Q4_K_XL` is the practical upper-bound control
+- `DS4Style-v0` is the practical "push harder" candidate
+- the study should compare them both against `Q8_0`
+
+### Why this is the correct upper-bound framing
+
+Repo-truth evidence already points to routed experts as the main compression
+surface:
+
+- `Q4_K_XL` does not uniformly lower everything
+- it lowers routed experts first
+- it keeps dense/shared/attention tensors substantially better protected
+- earlier Qwen policy notes already reached the same conclusion
+
+So for Qwen, an "upper Q4 contract" should mean:
+
+- a routed-expert-heavy mixed contract near `Q4_K_XL` quality, not a blunt
+  uniform Q4 export
+
+### Tooling reality
+
+The local pieces now exist to make this study concrete:
+
+- HF source contract probe:
+  - `gguf-tools/qwen36/qwen36_hf_contract_probe.py`
+- exact source shape verifier:
+  - `gguf-tools/qwen36/qwen36_v0_source_verify.py`
+- tensor payload probe:
+  - `gguf-tools/qwen36/qwen36_payload_probe.py`
+- local experimental exporter:
+  - `gguf-tools/qwen36/qwen36_v0_export_experimental.py`
+- local quant backend:
+  - `gguf-tools/libds4q.so`
+
+The local HF source is present:
+
+- `/mnt/e/tensors/Qwen3.6-35B-A3B`
+
+So the remaining work is not discovery.
+
+It is study execution.
+
+### Immediate study sequence
+
+#### Stage 1: structural proof
+
+Prove that the local source contract and exporter path are still valid:
+
+1. verify HF shapes against the frozen `v0` contract
+2. run exporter dry-run
+3. confirm byte split and synthetic-imatrix count
+
+This proves that the alternate contract is source-backed and buildable.
+
+#### Stage 2: produce a reproducible local candidate
+
+Export one full experimental `DS4Style-v0` GGUF from:
+
+- HF safetensors
+- `Q8_0` template
+- local DS4 quant backend
+
+Important interpretation:
+
+- this file is not the final policy winner
+- it is the first locally reproducible aggressive candidate that can be
+  compared honestly against both `Q8_0` and `Q4_K_XL`
+
+#### Stage 3: narrow tensor sanity
+
+Before any long oracle run:
+
+1. payload-probe a few load-bearing tensors
+2. payload-probe a few routed tensors
+3. confirm that dequantized values are numerically sane and shaped correctly
+
+Good first tensor set:
+
+- `token_embd.weight`
+- `blk.0.ffn_gate_exps.weight`
+- `blk.0.ffn_down_exps.weight`
+- `blk.39.ffn_down_exps.weight`
+- `blk.39.attn_output.weight`
+
+#### Stage 4: behavior comparison
+
+Then compare:
+
+- `Q8_0`
+- `UD_Q4_K_XL`
+- local `DS4Style-v0`
+
+with the same oracle prompts and the same runtime path.
+
+The first question is not "is it perfect?"
+
+The first question is:
+
+- does local `DS4Style-v0` stay in the same qualitative band as `Q4_K_XL`
+- or does it behave more like the much harsher failed low-bit candidates
+
+### Decision gates
+
+For the first pass, the useful gates are:
+
+- argmax equality on short prompts where `Q4_K_XL` already behaves well
+- top-k overlap relative to `Q8_0`
+- splice/output RMSE relative to `Q8_0`
+- whether the decoded text stays in the same semantic lane as `Q8_0`
+
+The practical interpretation should be:
+
+- if `DS4Style-v0` tracks `Q4_K_XL` closely, it becomes the new local baseline
+  for aggressive Qwen contract work
+- if it is materially worse than `Q4_K_XL`, the next move is not runtime work
+  first
+- the next move is policy rescue:
+  - promote some routed tensors
+  - likely late routed `down` first
+  - then possibly routed `gate/up` in the tail if needed
+
+### Oracle Ladder For Q4XL
+
+The `Q4XL` path should use the same three oracle classes, but not all of them
+for every iteration.
+
+1. Structural oracle
+
+- purpose:
+  - prove the contract itself is sane
+  - prove promoted tensors and routed experts dequantize close enough to the
+    `Q8_0` control
+- canonical tools:
+  - [qwen36_q4xl_routed_oracle.py](/mnt/f/git/ds4/gguf-tools/qwen36/qwen36_q4xl_routed_oracle.py)
+  - [qwen36_q4xl_fixture_study.py](/mnt/f/git/ds4/gguf-tools/qwen36/qwen36_q4xl_fixture_study.py)
+  - [qwen36_q4xl_oracle.py](/mnt/f/git/ds4/gguf-tools/qwen36/qwen36_q4xl_oracle.py)
+- comparison:
+  - `Q8_0` GGUF tensor payloads vs `Q4XL` GGUF tensor payloads
+- use this when:
+  - export policy changes
+  - promoted tensor families change
+  - we need byte-level proof before touching runtime
+
+2. Fast math oracle
+
+- purpose:
+  - check whether a specific GPU branch is still mathematically healthy
+  - do this without paying the full HuggingFace oracle cost every time
+- canonical tools:
+  - [qwen36_full_attn_decode_study.py](/mnt/f/git/ds4/gguf-tools/qwen36/qwen36_full_attn_decode_study.py)
+  - worker `DBG_FULL` / `DBG_FULL_CPU` instrumentation
+- comparison:
+  - runtime GPU stage vs in-worker CPU reference stage
+- use this when:
+  - full-attention decode kernels change
+  - KV/cache plumbing changes
+  - sync reduction changes GPU scheduling but should not materially change math
+
+3. Behavioral runtime oracle
+
+- purpose:
+  - compare end-to-end runtime behavior quickly, without HF in the loop
+  - this is the default day-to-day oracle for `Q8 runtime vs Q4XL runtime`
+- canonical tools:
+  - [qwen36_behavior_oracle.py](/mnt/f/git/ds4/gguf-tools/qwen36/qwen36_behavior_oracle.py)
+  - [qwen36_runtime_json_compare.py](/mnt/f/git/ds4/gguf-tools/qwen36/qwen36_runtime_json_compare.py)
+- comparison:
+  - patched-session JSON from `Q8_0` runtime vs patched-session JSON from
+    `Q4XL` runtime
+- primary metrics:
+  - same-token prefix
+  - token agreement rate
+  - Levenshtein distance
+  - decode timing and warmup buckets
+- use this when:
+  - runtime scheduling changes
+  - kernel residency changes
+  - `Q4XL` is being promoted as the execution control
+
+Important discipline:
+
+- do not force the slow HF oracle into every `Q4XL` iteration
+- use HF/PyTorch only to refresh structural truth or to adjudicate suspicious
+  regressions
+- use the in-worker CPU debug oracle for fast math checks
+- use runtime-vs-runtime JSON comparison as the primary `Q4XL` progress gauge
+
+### July 1, 2026 Q4XL hybrid GPU bridge clarification
+
+The first live `Q4XL` patched-session failures exposed a missing distinction in
+the study:
+
+- generic contract binding plus generic CPU row decode does **not** imply that
+  the unified hybrid GPU FFN path supports `Q4XL`
+- the failing surface was specifically the routed-expert slice inside
+  `run_hybrid_layer_step_gpuproj(...)`
+
+What is now true in-tree:
+
+- the first `Q4XL` bridge failures were not enough to prove whether the blocker
+  lived in dense projection dispatch or in the routed-expert slice
+- after the July 2 type-dispatch fix, the remaining immediate blocker is no
+  longer the dense hybrid projection path
+- the routed expert tensors in `Q4XL` are mixed:
+  - gate/up: `Q4_K` or `Q5_K`
+  - down: `Q5_K` or `Q6_K`
+- the current ROCm DS4 routed-MoE launcher does not natively cover that exact
+  mixed tuple
+- therefore the safe bridge is:
+  - keep the GPU hybrid path for supported projection/shared surfaces
+  - fall back to the generic CPU expert cache path for unsupported routed
+    expert types
+
+Validation shape for this bridge:
+
+- use the new first-step micro wrapper:
+  - [qwen36_q4xl_bridge_micro.py](/mnt/f/git/ds4/gguf-tools/qwen36/qwen36_q4xl_bridge_micro.py)
+- then re-run the normal patched-session oracle only after the micro looks sane
+
+Interpretation:
+
+- this is still borrowing the DS4 routed-MoE execution model in spirit, but
+  not yet the full mixed-quant ROCm kernel path
+- a native mixed `Q4_K/Q5_K -> Q5_K/Q6_K` routed-MoE GPU path remains future
+  work
+
+### July 2, 2026 Q4XL hybrid GPU projection type-dispatch fix
+
+The first strong `Q4XL` CPU-vs-GPU prefill bridge failure turned out **not** to
+be a generic "Q4XL is too noisy" problem and **not** a routed-expert issue.
+
+It was a concrete hybrid GPU dense-matmul bug.
+
+Root cause:
+
+- the hybrid GPU path was still hard-wired to `ds4_gpu_matmul_q8_0_tensor(...)`
+  for several dense projection surfaces
+- in `Q4XL`, those surfaces are **not** all `Q8_0`
+- the decisive offenders were:
+  - `blk.*.ssm_alpha.weight`
+  - `blk.*.ssm_beta.weight`
+- payload probe confirmed those tensors are `F32` in the promoted `Q4XL`
+  contract
+
+In other words:
+
+- the bridge was numerically broken because the worker was executing `F32`
+  tensor payloads through a `Q8_0` matmul path
+- that error then appeared downstream as prefill boundary drift and unstable
+  decode behavior
+
+Patch shape:
+
+- add a typed helper:
+  - `hybrid_gpu_dense_matmul_tensor(...)`
+- dispatch by GGUF tensor type:
+  - `Q8_0 -> ds4_gpu_matmul_q8_0_tensor`
+  - `F32 -> ds4_gpu_matmul_f32_tensor`
+  - `F16 -> ds4_gpu_matmul_f16_tensor`
+- apply the helper to the hybrid GPU dense projection surfaces:
+  - `attn_gate`
+  - `ssm_alpha`
+  - `ssm_beta`
+  - `ssm_out`
+- apply the same correction in the batched hybrid prefill GPU path
+
+This is the `Q4XL` analogue of the earlier `Q8` bridge work:
+
+- do not assume the failing surface is the complicated later-stage logic
+- first prove the earliest owned boundary with a dedicated bridge oracle
+- then repair the exact math dispatch error before touching higher-level decode
+  logic
+
+Measured effect on the integrated CPU-vs-GPU prefill bridge:
+
+- before type fix:
+  - `max_abs ~= 6.66187382`
+  - `mean_abs ~= 0.28431969`
+  - `cosine ~= 0.55776801`
+- after type fix:
+  - `max_abs ~= 0.12550922`
+  - `mean_abs ~= 0.02718719`
+  - `cosine ~= 0.99588946`
+
+Measured cycle-boundary tightening after the fix:
+
+- cycle `0`:
+  - `POST_L1_LAST`
+    - CPU `rms ~= 0.01674797`
+    - GPU `rms ~= 0.01678520`
+  - `POST_L2_LAST`
+    - CPU `rms ~= 0.02546028`
+    - GPU `rms ~= 0.02540704`
+  - `POST_FULL3_LAST`
+    - CPU `rms ~= 0.02656421`
+    - GPU `rms ~= 0.02666798`
+
+Interpretation:
+
+- `Q4XL` is now promoted past the earlier "bridge is structurally broken"
+  stage
+- hybrid/full prefill handoff is in the same practical parity regime that
+  allowed the `Q8` path to move forward
+- this does **not** mean `Q4XL` has reached performance parity with `Q8`
+
+Current remaining blocker is different:
+
+- `Q4XL` routed experts are now GPU-executed in the owned worker, but not via
+  the same native quantized path as `Q8`
+- the existing true routed-MoE ROCm fast path still only naturally fits the
+  `Q8_0` and DS4-native quantized tuples
+- the promoted `Q4XL` routed tensors are mixed:
+  - gate/up: `Q4_K` or `Q5_K`
+  - down: `Q5_K` or `Q6_K`
+- so the current bridge is:
+  - decode routed expert rows once into the existing float expert cache
+  - run gate/up/down expert matmuls on GPU with `ds4_gpu_matmul_f32_tensor(...)`
+  - keep accumulation/orchestration identical to the `Q8` control path
+- this removes the old CPU expert-matvec fallback, but it is still not the same
+  native quantized execution regime as `Q8`
+
+So the current truth is:
+
+- `Q4XL` correctness bridge: promoted
+- `Q4XL` routed-expert compute ownership: promoted to GPU
+- `Q4XL` routed-expert kernel parity with `Q8`: not yet promoted
+- speed comparisons versus `Q8` are therefore still not a pure model-only
+  comparison
+- decoded-F32 expert GPU replay must stay opt-in:
+  - enable only with `QWEN36_GPU_DECODED_EXPERTS=1`
+  - the default `Q4XL` bridge should use the previously validated expert-cache
+    path until native mixed-quant kernels are available
+  - otherwise the resident decoded expert cache can hit the VRAM cliff before
+    the run reaches later layers
+
+### July 2, 2026 Q4+Q2 Straggler-Crush Study Lane
+
+After the `Q4XL` bridge became numerically sane again, the next artifact-level
+question was narrower than `DS4Style-v0`:
+
+- can the validated `Q4+Q2` bridge be simplified further by crushing the
+  remaining routed `Q5_K/Q6_K` tensors down to `Q4_K`
+- while keeping the already-proven `Q2`-class routed tensors untouched
+
+Why this lane matters:
+
+- it is a direct cleanup of the working `Q4+Q2` bridge rather than a fresh jump
+  to a much more aggressive contract
+- if it holds, the artifact becomes more uniform and easier to map onto DS4-like
+  runtime handling
+- it recovers real size without discarding the correctness progress already won
+  on the `Q4+Q2` bridge
+
+Concrete target surfaces in the promoted `Q4XL` family:
+
+- routed `gate/up`
+  - layer `1` still carries `Q5_K`
+- routed `down`
+  - most layers still carry `Q5_K`
+  - layers `1, 34, 38, 39` still carry `Q6_K`
+
+Required validation shape for this lane:
+
+1. Export or splice only the routed straggler tensors.
+2. Rebuild fixtures and prove untouched tensors remain invariant.
+3. Run the normal bridge/runtime oracles against the cleaned artifact.
+4. Only then compare size and performance deltas.
+
+Do not treat this lane as proof of `DS4Style-v0`.
+
+- passing result means:
+  - `Q4+Q2 cleaned` is viable
+- passing result does **not** mean:
+  - the `IQ2/IQ3` routed-expert end-state is automatically validated
+
+Current down-only result:
+
+- candidate:
+  - `/mnt/e/tensors/Qwen3.6-35B-A3B-UD-Q4_K_XL-downQ4-spliced.gguf`
+- fixture invariant check:
+  - passed for untouched hybrid fixture tensors
+- bad-path discovery:
+  - with decoded-F32 expert GPU replay enabled by default, both original `Q4XL`
+    and `downQ4-spliced` can hit the resident-cache VRAM cliff around late
+    prefill
+  - failure signature:
+    - `ERROR gpu decoded expert gate failed blk.28`
+    - cache near `22+ GiB`
+- fix:
+  - decoded-F32 expert GPU replay is now opt-in behind
+    `QWEN36_GPU_DECODED_EXPERTS=1`
+  - default path returns to the previously validated expert-cache bridge
+- post-fix smoke result, `n_predict=16`:
+  - original `Q4XL`:
+    - prefill `49765.93 ms`
+    - decode average `2086.97 ms/token`
+  - `downQ4-spliced`:
+    - prefill `91083.35 ms`
+    - decode average `4389.59 ms/token`
+  - token agreement:
+    - same prefix `11/16`
+    - agreement rate `0.688`
+    - divergence remains semantically plausible
+
+Interpretation:
+
+- `downQ4-spliced` is not structurally broken
+- the memory cliff was caused by the decoded-F32 expert GPU replay path, not by
+  the spliced artifact itself
+- `downQ4-spliced` should **not** be promoted yet because current runtime
+  performance regresses too much on the default bridge
+- next useful work is either:
+  - optimize `Q4_K` routed-down decode/cache behavior, or
+  - build a native mixed-quant routed path before extending the straggler crush
+    to layer-1 `gate/up`
+
+Correction to the active target:
+
+- the goal is not to validate a slower generic `Q4XL` bridge forever
+- the goal is to port the already-proven `Q8+Q2` runtime optimizations onto
+  the already-validated `Q4+Q2` artifact path
+- that specifically means:
+  - preserve the Q2-safe routed expert surfaces
+  - keep the Q4 upper-bound surfaces where already validated
+  - route DS4-native tuples through the same native routed-MoE GPU launcher used
+    by the optimized Q8/Q2 path
+  - keep decoded-F32 expert replay as a diagnostic fallback only
+
+Runtime patch status for this correction:
+
+- `Q2_K` is now first-class in the Qwen GGUF type vocabulary
+- full-layer routed-MoE support now matches the DS4 launcher truth:
+  - `(Q4_K, Q4_K)`
+  - `(IQ2_XXS, Q2_K)`
+  - `(Q2_K, Q2_K)`
+- hybrid layers now have a native routed-MoE branch for the same supported
+  tuples, now default-on with `QWEN36_FULL_GPU_ROUTED_MOE=0` as the opt-out
+- full-layer routed-MoE now passes the real full-layer id into the DS4 launcher
+  instead of hardcoding `layer_index=0`
+  - this matters because DS4 expert residency/streaming caches are keyed by
+    layer
+  - without it, full layers alias their routed-MoE cache identity and miss part
+    of the Q8+Q2 ownership/persistence behavior
+- this ports the key Q8+Q2 optimization shape to the Q4+Q2 path:
+  - one routed-MoE launch per hybrid/full FFN closure when the quant tuple is
+    DS4-native
+  - no decoded-F32 resident expert cache unless explicitly requested with
+    `QWEN36_GPU_DECODED_EXPERTS=1`
+
+Promotion gate:
+
+- use the known-good Q4+Q2 artifact/fixtures, not the known-bad generic
+  downQ4 validator path
+- run behavior with:
+  - default routed-MoE behavior, or `QWEN36_FULL_GPU_ROUTED_MOE=1`
+  - no `QWEN36_GPU_DECODED_EXPERTS`
+- compare against the established Q4+Q2 control and Q8+Q2 timing/behavior
+  JSONs
+- if this regresses text or stage RMSE, debug the native routed-MoE tuple path
+  directly rather than falling back to decoded-F32 replay
+
+### July 2, 2026 Q4XL routed-expert GPU bridge
+
+After the dense projection type-dispatch fix, the next step was to repeat the
+same ownership migration that made the `Q8` path useful:
+
+- move the routed expert math itself off the CPU
+- do it without pretending the DS4 native routed-MoE launchers already cover
+  the mixed `Q4_K/Q5_K -> Q5_K/Q6_K` contract
+
+Root cause of the old slowdown:
+
+- hybrid layers still fell back to CPU expert-cache `matvec(...)`
+- full layers also fell back to host-side routed expert math whenever the
+  tensor tuple was outside the `Q8_0` fast path
+- this made the first "correct" `Q4XL` bridge much slower than `Q8`, even
+  after the projection math was fixed
+
+Patch shape:
+
+- keep the existing native `Q8_0` routed GPU path unchanged
+- add a generic routed-expert GPU bridge for promoted `Q4XL` types:
+  - supported decoded source types:
+    - `Q8_0`
+    - `Q4_K`
+    - `Q5_K`
+    - `Q6_K`
+- reuse the already-existing decoded float expert cache
+- execute routed expert gate/up/down on GPU with:
+  - `ds4_gpu_matmul_f32_tensor(...)`
+- batch the per-expert GPU work in the same command window pattern already used
+  in the `Q8` expert batching work
+- apply this in both places:
+  - hybrid owned worker routed expert loop
+  - owned full-layer FFN routed expert loop
+
+Interpretation:
+
+- this is the right bridge for `Q4XL` now
+- it restores GPU ownership of the heavy routed expert math
+- it is still a bridge, not the final kernel end-state
+- the remaining future step is a native mixed-quant routed-MoE GPU launcher for
+  the `Q4XL` contract rather than decoded-float expert replay
+
+### Repeat-Q8 bringup checklist for Q4XL
+
+From this point on, `Q4XL` should repeat the same promotion ladder that got the
+`Q8` path into its current stable regime.
+
+Do not skip steps.
+
+1. Standalone prefill bridge
+
+- prove CPU-vs-GPU prefill parity on the owned worker itself
+- use boundary and cycle signatures
+- promotion gate:
+  - cosine near `1.0`
+  - no monotonic blow-up across `POST_L1`, `POST_L2`, `POST_FULL3`
+
+2. Focused owned-session micro behavior
+
+- run one-token prefill plus forced-step decode
+- confirm the first token lane is sane
+- use this to catch catastrophic bridge failures before long runs
+
+3. Short patched-session behavior run
+
+- run a short real decode continuation
+- compare text lane and token prefix against the `Q8_0` runtime control
+- this is the first place where semantic drift matters
+
+4. Runtime-vs-runtime 256-token compare
+
+- only after the first three gates look sane
+- compare:
+  - prefill time
+  - decode average
+  - warmup buckets
+  - same-token prefix
+  - agreement rate
+
+5. Only then performance claims
+
+- no speed claim should be promoted until the same owned surfaces are active
+- for `Q4XL`, that specifically means routed-expert GPU parity must be audited
+  before treating slower decode as a model-property verdict
+
+Operational rule:
+
+- when `Q4XL` fails, first ask:
+  - is this the same class of early-bridge bug we already had to fix for `Q8`
+- if yes:
+  - localize the earliest boundary
+  - patch the exact math/dispatch mismatch
+  - re-promote step by step
+- do **not** jump straight to late-stage decode semantics or broad speed
+  conclusions
+
+### Commands
+
+Verify the frozen HF source mapping:
+
+```bash
+python3 /mnt/f/git/ds4/gguf-tools/qwen36/qwen36_v0_source_verify.py \
+  --hf /mnt/e/tensors/Qwen3.6-35B-A3B \
+  --show-fused
+```
+
+Dry-run the experimental exporter:
+
+```bash
+python3 /mnt/f/git/ds4/gguf-tools/qwen36/qwen36_v0_export_experimental.py \
+  --hf /mnt/e/tensors/Qwen3.6-35B-A3B \
+  --template /home/tritonn/.cache/huggingface/hub/models--unsloth--Qwen3.6-35B-A3B-GGUF/snapshots/a483e9e6cbd595906af30beda3187c2663a1118c/Qwen3.6-35B-A3B-Q8_0.gguf \
+  --dry-run
+```
+
+Write the experimental GGUF:
+
+```bash
+python3 /mnt/f/git/ds4/gguf-tools/qwen36/qwen36_v0_export_experimental.py \
+  --hf /mnt/e/tensors/Qwen3.6-35B-A3B \
+  --template /home/tritonn/.cache/huggingface/hub/models--unsloth--Qwen3.6-35B-A3B-GGUF/snapshots/a483e9e6cbd595906af30beda3187c2663a1118c/Qwen3.6-35B-A3B-Q8_0.gguf \
+  --out /mnt/e/tensors/Qwen3.6-35B-A3B-DS4Style-v0-experimental.gguf
+```
+
+Probe selected payloads:
+
+```bash
+python3 /mnt/f/git/ds4/gguf-tools/qwen36/qwen36_payload_probe.py \
+  --hf /mnt/e/tensors/Qwen3.6-35B-A3B \
+  --gguf /mnt/e/tensors/Qwen3.6-35B-A3B-DS4Style-v0-experimental.gguf \
+  --tensor token_embd.weight \
+  --tensor blk.0.ffn_gate_exps.weight \
+  --tensor blk.0.ffn_down_exps.weight \
+  --tensor blk.39.ffn_down_exps.weight \
+  --tensor blk.39.attn_output.weight
+```
+
+### Current recommendation
+
+Do not invent a new all-Q4 contract.
+
+Treat:
+
+- `UD_Q4_K_XL` as the empirical upper-bound control
+- `DS4Style-v0` as the reproducible aggressive candidate
+
+Then let oracle behavior decide whether the `v0` routed-expert policy is good
+enough or needs selective rescue.
+
 Interpretation:
 
 - the incremental GPU KV variant tightened the worst focused full-attention stage error by roughly `~6.9%`
@@ -232,6 +1083,21 @@ Interpretation:
   - top-k stayed effectively identical on the audited row
 - this does **not** yet prove an end-to-end decode win
 - it **does** justify continuing from the gated+projected branch rather than discarding GPU full-attention decode outright
+
+Behavior-run timing verdict on the same 256-token prompt:
+
+- baseline default run (`/tmp/qwen36_default_256.json`):
+  - prefill `~12222.72 ms`
+  - owned decode average `~268.76 ms/token`
+  - HF tail average `~57.75 ms/token`
+- gated GPU-attention branch (`/tmp/qwen36_default_256_gpu_attn_gated.json`):
+  - prefill `~12441.54 ms`
+  - owned decode average `~274.25 ms/token`
+  - HF tail average `~56.98 ms/token`
+- practical reading:
+  - focused math improved
+  - end-to-end owned decode got slightly slower by `~5.49 ms/token`
+  - therefore this branch is a correctness-forward staging point, not yet a decode-speed win
 
 Current rule for this branch:
 
@@ -248,6 +1114,14 @@ Router-select widening now also landed as an enabling patch:
 - DS4 already had GPU router-select helpers
 - but both ROCm and CUDA router-select paths were still hard-shaped to DeepSeek-style top-6 selection
 - they now accept up to top-8 selection width while preserving top-6 as the default when the caller passes zero/default width
+
+Next active experiment gate:
+
+- `QWEN36_FULL_GPU_ROUTED_MOE=1`
+- this keeps CPU router top-k selection unchanged
+- but swaps the per-expert GPU execution plus CPU weighted accumulation in the Qwen FFN helper for `ds4_gpu_routed_moe_batch_tensor`
+- this is intended as a launch/sync reduction experiment first
+- correctness should therefore be audited against the same behavior-oracle and focused RMSE studies before treating it as a default speed path
 - patched files:
   - `rocm/ds4_rocm_runtime.cuh`
   - `rocm/ds4_rocm_router.cuh`
@@ -274,7 +1148,7 @@ Immediate audit target after this localization:
 Immediate action harness:
 
 - dedicated first-full-boundary prefill substage audit:
-  - `misc/qwen36_blk3_prefill_full_debug.py`
+  - `gguf-tools/qwen36/qwen36_blk3_prefill_full_debug.py`
   - enables GPU-vs-CPU stage diffs for the first owned full layer during prefill
   - emits per-row `DBG_FULL[3]` diffs for:
     - `ATTN_IN`
@@ -305,7 +1179,7 @@ Groundbreaking contract correction from the `blk.3` harness:
   - `qwen36_unified_full_gpu.inc`
   - `qwen36_gpu_full_layer_worker.c`
 
-Measured effect from the focused `blk.3` prefill harness (`misc/qwen36_blk3_prefill_full_debug.py`):
+Measured effect from the focused `blk.3` prefill harness (`gguf-tools/qwen36/qwen36_blk3_prefill_full_debug.py`):
 
 - before the patch:
   - `row=0 Q_CUR ~= 0.0321`
@@ -339,7 +1213,7 @@ Operational rule for the next study phase:
 
 The one-shot entrypoint now reflects that ordering:
 
-- `misc/qwen36_blk0_prefill_one_shot.py`
+- `gguf-tools/qwen36/qwen36_blk0_prefill_one_shot.py`
   - phase 1: standalone full-layer prefill isolation
   - phase 2: power-of-2 owned-layer splice validation
   - phase 3: optional GPU-vs-CPU row-state summary from prefill logs
@@ -374,12 +1248,12 @@ Interpretation:
 Two artifact types exist and they are not interchangeable.
 
 - Prefix/static fixture:
-  - produced by `misc/qwen36_c_prefix_fixture_export.py`
+  - produced by `gguf-tools/qwen36/qwen36_c_prefix_fixture_export.py`
   - prompt-specific
   - contains prompt token ids plus captured HF layer-0 input sequence
   - format magic: `Q36PFX01`
 - Live contract fixture:
-  - produced by `misc/qwen36_live_contract_export.py`
+  - produced by `gguf-tools/qwen36/qwen36_live_contract_export.py`
   - prompt-agnostic
   - contains per-layer hybrid live weights/contract state
   - format magic: `Q36LCF01`
@@ -404,12 +1278,12 @@ This was the key provenance gap in the earlier study text:
 The orchestration layer supports two materially different fixture-consumption modes.
 
 - Composed Python worker path:
-  - orchestrated through `run_owned_prefix_cycles(...)` in `misc/qwen36_hybrid_prefix_tail_greedy.py`
+  - orchestrated through `run_owned_prefix_cycles(...)` in `gguf-tools/qwen36/qwen36_hybrid_prefix_tail_greedy.py`
   - can use a prompt-specific `blk0.prefix.bin`
   - cycle `0` may own only two live fixtures when a separate prefix worker seeds the layer-0 input sequence
   - this is the path where “prefix artifact + later live fixtures” is structurally valid
 - Native owned-session / unified worker path:
-  - orchestrated through `OwnedSession._ensure_workers()` in `misc/qwen36_behavior_oracle.py`
+  - orchestrated through `OwnedSession._ensure_workers()` in `gguf-tools/qwen36/qwen36_behavior_oracle.py`
   - config emitted by `write_owned_session_config(...)`
   - config contains only `cycle <full_layer> <fixture0,fixture1,...>` lines
   - the unified C worker then calls `fixture_load(...)` on every listed path
@@ -438,7 +1312,7 @@ Prompt-specific prefix artifact:
 - source:
   - HF model directory `/mnt/e/tensors/Qwen3.6-35B-A3B`
 - exporter:
-  - `misc/qwen36_c_prefix_fixture_export.py`
+  - `gguf-tools/qwen36/qwen36_c_prefix_fixture_export.py`
 - output family:
   - `.cache/qwen36_live_contracts/Qwen3.6-35B-A3B-Q8_0/prompts/<prompt_name>/blk0.prefix.bin`
 - purpose:
@@ -450,7 +1324,7 @@ Prompt-agnostic live fixtures:
   - active executable runtime GGUF
   - currently the HuggingFace-cache `Qwen3.6-35B-A3B-Q8_0.gguf`
 - exporter:
-  - `misc/qwen36_live_contract_export.py`
+  - `gguf-tools/qwen36/qwen36_live_contract_export.py`
 - output family:
   - `.cache/qwen36_live_contracts/Qwen3.6-35B-A3B-Q8_0/shared/blk*.live.bin`
 - purpose:
@@ -976,7 +1850,7 @@ Current conclusion:
     - FFN / router path
     - full-layer state update semantics after those corrected projections
 - to reduce shell/invocation mistakes during these probes, the canonical entrypoint is now:
-  - `misc/qwen36_full_layer_probe.py`
+  - `gguf-tools/qwen36/qwen36_full_layer_probe.py`
   - it assembles the known-good patched-session oracle command, the ten full-layer placements, and the shared fixture set automatically
   - intended modes:
     - `--probe baseline`
@@ -1009,20 +1883,20 @@ Current conclusion:
 
 ## Micro Validators Added
 
-- `misc/qwen36_payload_probe.py`
+- `gguf-tools/qwen36/qwen36_payload_probe.py`
   - dequantized selected GGUF tensors and compared them to HF source tensors
   - results showed sane numerical correlation rather than malformed payloads
-- `misc/qwen36_router_probe.py`
+- `gguf-tools/qwen36/qwen36_router_probe.py`
   - native HF router oracle for selected prompts/layers
-- `misc/qwen36_router_compare.py`
+- `gguf-tools/qwen36/qwen36_router_compare.py`
   - recomputes router logits from exported GGUF router tensors under HF hidden states
-- `misc/qwen36_moe_compare.py`
+- `gguf-tools/qwen36/qwen36_moe_compare.py`
   - replays the sparse MoE block using exported GGUF tensors under HF hidden states
-- `misc/qwen36_layer_trace_export.py`
+- `gguf-tools/qwen36/qwen36_layer_trace_export.py`
   - exports reusable per-layer activation fixtures from native HF Qwen
-- `misc/qwen36_moe_replay_from_trace.py`
+- `gguf-tools/qwen36/qwen36_moe_replay_from_trace.py`
   - replays the MoE half of a traced layer offline from GGUF + saved fixtures
-- `misc/qwen36_c_moe_fixture_export.py`
+- `gguf-tools/qwen36/qwen36_c_moe_fixture_export.py`
   - exports a single-layer staged fixture with selected experts expanded to `f32` for C-side replay
 - `qwen36_c_moe_replay.c`
   - pure C replay of the post-mixer residual boundary, traced MoE branch, and final residual merge
@@ -1194,7 +2068,7 @@ We replaced the prompt-bound expert-fixture replay with a dynamic GGUF-backed pr
 
 Prompt:
 
-- `misc/qwen36_oracle_prompts/patch_plan.txt`
+- `gguf-tools/qwen36/qwen36_oracle_prompts/patch_plan.txt`
 
 Result:
 
@@ -1228,7 +2102,7 @@ We then extended ownership across the first full-attention layer:
 
 Prompt:
 
-- `misc/qwen36_oracle_prompts/patch_plan.txt`
+- `gguf-tools/qwen36/qwen36_oracle_prompts/patch_plan.txt`
 
 Result:
 
@@ -1323,7 +2197,7 @@ We also added a direct GGUF row-read path for root surfaces:
 
 - `qwen36_gguf_read_tensor_bytes(...)`
 - `qwen36_c_root_q8_selected_logits.c`
-- `misc/qwen36_root_hf_probe.py`
+- `gguf-tools/qwen36/qwen36_root_hf_probe.py`
 
 Current Q8-oracle root check:
 
@@ -1345,7 +2219,7 @@ Interpretation:
 
 ## Short Instruction Prompt Check
 
-We also ran the same C replay path on a short instruction-style prompt from `misc/qwen36_oracle_prompts/patch_plan.txt`.
+We also ran the same C replay path on a short instruction-style prompt from `gguf-tools/qwen36/qwen36_oracle_prompts/patch_plan.txt`.
 
 Trace:
 
@@ -1468,7 +2342,7 @@ Interpretation:
 
 We added a narrow C validator for the linear-attention projection/staging boundary:
 
-- `misc/qwen36_c_linear_fixture_export.py`
+- `gguf-tools/qwen36/qwen36_c_linear_fixture_export.py`
 - `qwen36_c_linear_replay.c`
 
 Fixture used:
@@ -1508,7 +2382,7 @@ We then extended the linear-attention trace to include full-sequence projection 
 
 New tools:
 
-- `misc/qwen36_c_linear_conv_fixture_export.py`
+- `gguf-tools/qwen36/qwen36_c_linear_conv_fixture_export.py`
 - `qwen36_c_linear_conv_replay.c`
 
 Fixture:
@@ -1547,8 +2421,8 @@ We then extracted the actual inputs consumed by the DeltaNet rule:
 
 New tools:
 
-- `misc/qwen36_linear_core_trace_export.py`
-- `misc/qwen36_c_linear_core_fixture_export.py`
+- `gguf-tools/qwen36/qwen36_linear_core_trace_export.py`
+- `gguf-tools/qwen36/qwen36_c_linear_core_fixture_export.py`
 - `qwen36_c_linear_core_replay.c`
 
 Fixture:
@@ -1582,7 +2456,7 @@ Interpretation:
 
 We then validated the gated RMS normalization stage directly:
 
-- `misc/qwen36_c_linear_norm_fixture_export.py`
+- `gguf-tools/qwen36/qwen36_c_linear_norm_fixture_export.py`
 - `qwen36_c_linear_norm_replay.c`
 
 Fixture:
@@ -1620,7 +2494,7 @@ Interpretation:
 
 We then completed a stubbed end-to-end `linear_attention` layer validator in C:
 
-- `misc/qwen36_c_linear_layer_stub_fixture_export.py`
+- `gguf-tools/qwen36/qwen36_c_linear_layer_stub_fixture_export.py`
 - `qwen36_c_linear_layer_stub_replay.c`
 
 Fixture:
@@ -1684,7 +2558,7 @@ Interpretation:
 
 We then integrated the validated CPU recurrence back into the traced `linear_attention` layer replay:
 
-- `misc/qwen36_c_linear_layer_full_fixture_export.py`
+- `gguf-tools/qwen36/qwen36_c_linear_layer_full_fixture_export.py`
 - `qwen36_c_linear_layer_full_replay.c`
 
 Fixture:
@@ -1716,7 +2590,7 @@ Interpretation:
 
 We then joined the completed `linear_attention` mixer path with the staged MoE replay into one traced decoder-layer validator:
 
-- `misc/qwen36_c_decoder_layer_fixture_export.py`
+- `gguf-tools/qwen36/qwen36_c_decoder_layer_fixture_export.py`
 - `qwen36_c_decoder_layer_replay.c`
 
 Fixture:
@@ -1798,7 +2672,7 @@ We then replaced the last major traced shortcut on the hybrid mixer side.
 
 New artifacts:
 
-- `misc/qwen36_c_linear_layer_weight_fixture_export.py`
+- `gguf-tools/qwen36/qwen36_c_linear_layer_weight_fixture_export.py`
 - `qwen36_c_linear_layer_weight_replay.c`
 
 This validator no longer consumes traced `query/key/value/beta/g` directly. Instead it computes, in one narrow C path:
@@ -1873,7 +2747,7 @@ We then completed the next major replacement step by removing the traced MoE sho
 
 New artifacts:
 
-- `misc/qwen36_c_decoder_layer_weight_fixture_export.py`
+- `gguf-tools/qwen36/qwen36_c_decoder_layer_weight_fixture_export.py`
 - `qwen36_c_decoder_layer_weight_replay.c`
 
 This validator computes, in one narrow CPU C path:
@@ -1976,7 +2850,7 @@ Interpretation:
 
 We then performed the first real output-surface sanity check using a splice method:
 
-- `misc/qwen36_splice_two_layer_weight_check.py`
+- `gguf-tools/qwen36/qwen36_splice_two_layer_weight_check.py`
 
 Method:
 
@@ -2190,10 +3064,10 @@ That is exactly what happened here.
 ### What we patched
 
 - Exporters now reorder all affected hybrid tensors into HF runtime order before writing weight-driven fixtures:
-  - `misc/qwen36_c_decoder_layer_weight_fixture_export.py`
-  - `misc/qwen36_c_linear_layer_weight_fixture_export.py`
-  - `misc/qwen36_c_linear_core_fixture_export.py`
-  - `misc/qwen36_c_linear_fixture_export.py`
+  - `gguf-tools/qwen36/qwen36_c_decoder_layer_weight_fixture_export.py`
+  - `gguf-tools/qwen36/qwen36_c_linear_layer_weight_fixture_export.py`
+  - `gguf-tools/qwen36/qwen36_c_linear_core_fixture_export.py`
+  - `gguf-tools/qwen36/qwen36_c_linear_fixture_export.py`
 - The C weight-driven replayers now consume `ssm_a` as the GGUF-native decay coefficient rather than re-exponentiating it:
   - `qwen36_c_linear_core_replay.c`
   - `qwen36_c_linear_layer_weight_replay.c`
@@ -2263,7 +3137,7 @@ Using:
 
 - narrow C chain: `qwen36-c-decoder-chain-weight`
 - splice layer: `2`
-- prompt: `misc/qwen36_oracle_prompts/patch_plan.txt`
+- prompt: `gguf-tools/qwen36/qwen36_oracle_prompts/patch_plan.txt`
 
 Results:
 
@@ -2334,14 +3208,14 @@ The new step was:
 
 ### New artifacts
 
-- `misc/qwen36_c_prefix_fixture_export.py`
+- `gguf-tools/qwen36/qwen36_c_prefix_fixture_export.py`
   - exports prompt token IDs and HF `blk.0` input-sequence reference
 - `qwen36_c_prefix_q8_chain_replay.c`
   - reads `token_embd.weight` from the Q8 GGUF
   - decodes prompt embedding rows in C
   - runs the corrected narrow `blk.0..2` chain
   - dumps the resulting hidden state for splice checks
-- `misc/qwen36_splice_prefix_q8_check.py`
+- `gguf-tools/qwen36/qwen36_splice_prefix_q8_check.py`
   - performs the output-surface splice check using the C-owned front edge
 
 ### Prefix ownership results
@@ -2586,7 +3460,7 @@ It is also the right next proof:
 The next expected validation sequence is:
 
 1. `qwen36-gpu-blk0-ffn-q8-oracle` succeeds end to end with the Qwen-local router/MoE orchestration.
-2. `misc/qwen36_gpu_blk0_ffn_splice_check.py` shows the HF-tail logits remain close.
+2. `gguf-tools/qwen36/qwen36_gpu_blk0_ffn_splice_check.py` shows the HF-tail logits remain close.
 3. Then we decide whether to:
    - keep extending Qwen-local host orchestration for the early oracle path, or
    - replace the host-routed expert loop with true `qwen36_*` HIP top-k=8 batch kernels.
@@ -2597,7 +3471,7 @@ We now have the first real HF-tail splice result from a GPU-owned Qwen block.
 
 Prompt:
 
-- `misc/qwen36_oracle_prompts/patch_plan.txt`
+- `gguf-tools/qwen36/qwen36_oracle_prompts/patch_plan.txt`
 
 Oracle result for `blk.0` FFN closure:
 
@@ -2669,7 +3543,7 @@ Path:
 
 Prompt:
 
-- `misc/qwen36_oracle_prompts/patch_plan.txt`
+- `gguf-tools/qwen36/qwen36_oracle_prompts/patch_plan.txt`
 
 Result:
 
@@ -3047,7 +3921,7 @@ So we isolated `blk.3` with the exact HF `layer_input_seq` from a new full-atten
 
 ### New Artifact
 
-- `misc/qwen36_full_attn_trace_export.py`
+- `gguf-tools/qwen36/qwen36_full_attn_trace_export.py`
 
 It exports `blk.3` full-attention internals including:
 
@@ -3137,7 +4011,7 @@ To keep that question precise, we now split validation into three tool classes.
 
 Artifact:
 
-- `misc/qwen36_splice_hidden_check.py`
+- `gguf-tools/qwen36/qwen36_splice_hidden_check.py`
 
 Purpose:
 
@@ -3158,7 +4032,7 @@ This is the correct tool when we want to answer:
 
 Artifact:
 
-- `misc/qwen36_composition_ladder_check.py`
+- `gguf-tools/qwen36/qwen36_composition_ladder_check.py`
 
 Purpose:
 
@@ -3183,7 +4057,7 @@ This is the correct tool when we want to answer:
 
 Existing artifact:
 
-- `misc/qwen36_hybrid_prefix_tail_greedy.py`
+- `gguf-tools/qwen36/qwen36_hybrid_prefix_tail_greedy.py`
 
 Purpose:
 
@@ -3409,13 +4283,13 @@ Trust this stack:
   - this is the proven CPU/GPU-owned prefix composition path, even though it still replays the full prefix
 - `qwen36_gpu_full_layer_q8_dynamic`
   - trusted full-attention ownership block for the `blk.3 / 7 / 11 / 15` positions
-- `misc/qwen36_hybrid_prefix_tail_greedy.py`
+- `gguf-tools/qwen36/qwen36_hybrid_prefix_tail_greedy.py`
   - trusted harness for the known-good replay-based owned prefix
-- `misc/qwen36_strict_first_step_validator.py`
+- `gguf-tools/qwen36/qwen36_strict_first_step_validator.py`
   - trusted strict prompt-bound validator
-- `misc/qwen36_shared_path_forced_validator.py`
+- `gguf-tools/qwen36/qwen36_shared_path_forced_validator.py`
   - trusted forced-token fidelity probe
-- `misc/qwen36_long_decode_ab.py`
+- `gguf-tools/qwen36/qwen36_long_decode_ab.py`
   - trusted behavioral long-decode A/B harness
 
 Do **not** currently build on:
@@ -3479,7 +4353,7 @@ Purpose:
 
 Harness integration:
 
-- `misc/qwen36_hybrid_prefix_tail_greedy.py`
+- `gguf-tools/qwen36/qwen36_hybrid_prefix_tail_greedy.py`
   - added `--prefix-seq-worker-bin`
   - added a persistent subprocess wrapper `PrefixSeqWorker`
   - fixed fixture counting so worker mode accepts `3N-1` hybrid fixtures
@@ -3541,7 +4415,7 @@ Current worker capabilities:
 
 Harness support:
 
-- `misc/qwen36_hybrid_prefix_tail_greedy.py`
+- `gguf-tools/qwen36/qwen36_hybrid_prefix_tail_greedy.py`
   - new `--c-bin-worker-bin`
   - current scope: one hybrid cycle only (`blk.1..2` in front of `blk.3`)
 
@@ -3652,7 +4526,7 @@ To address that, we added:
     - `DUMP_LAST`
     - `RESET`
     - `QUIT`
-- harness support in `misc/qwen36_hybrid_prefix_tail_greedy.py`
+- harness support in `gguf-tools/qwen36/qwen36_hybrid_prefix_tail_greedy.py`
   - new `--full-layer-worker-bin`
   - one persistent worker per full-attention cycle layer
   - current integration strategy:
@@ -3820,3 +4694,78 @@ Therefore the correct runtime direction is not "one persistent full worker per o
 - SSD-backed warm caches coordinated at the runtime level rather than by independent worker processes
 
 This result is strong enough to move study emphasis from "prove persistence works" to "design the proper unified runtime and streaming ownership model."
+
+## 2026-07-02 Q4+Q2 Runtime Parity: Top-k-8 Native MoE Gap
+
+The active post-pivot target is **not** arbitrary all-Q4, and not a reduced-depth validator path. The target is the already validated Q4+Q2 contract path:
+
+- keep the Q2-safe routed tensors as Q2
+- use Q4 as the upper-bound family for the remaining routed expert surfaces where viable
+- port the Q8+Q2 runtime optimizations to this Q4+Q2 path
+
+The observed runtime gap after enabling native routed MoE:
+
+- Q8+Q2 optimized path: roughly `180..300 ms/token`
+- Q4+Q2 native routed-MoE path: roughly `800..1200 ms/token`
+
+This gap should not be treated as inherent Q4/Q2 cost. DS4's routed-MoE ROCm path was originally specialized around DeepSeek-style `topk=6`:
+
+- `DS4_ROCM_N_EXPERT_USED = 6`
+- selected-expert streaming/cache override paths require `n_selected <= 6`
+- the single-token direct down-sum fast path was gated on `n_expert == 6`
+
+Qwen uses `topk=8`, so it can silently miss the top-k-6 fast path and fall back to materializing every expert down output plus a separate sum kernel.
+
+Patch direction:
+
+- add a top-k-N direct down-sum kernel for single-token routed MoE, valid up to `DS4_ROCM_MAX_EXPERT_USED`
+- use it for Qwen top-k-8 in the Q2_K and Q4_K routed-MoE paths
+- add `QWEN36_PATH_AUDIT=1` logging so Q4+Q2 runs report whether each layer is using GPU shared FFN, Q8 expert GPU, native routed MoE, decoded expert GPU, or CPU expert fallback
+- native routed-MoE selection for supported DS4 tuples is now default-on;
+  disable with `QWEN36_FULL_GPU_ROUTED_MOE=0` if a bridge-control run is needed
+
+The next required measurement is a Q4+Q2 decode run with:
+
+- `QWEN36_FULL_GPU_ROUTED_MOE=1`
+- `QWEN36_PATH_AUDIT=1`
+
+If timing is still far above Q8+Q2, inspect the audit lines first. Any `shared_gpu=0` or `cpu_experts=1` on the hot path means the runtime is still missing a GPU implementation for that tensor family rather than hitting an unavoidable quantization cost.
+
+## 2026-07-02 Q4+Original-Q2 Artifact Re-derived From Study Policy
+
+The Q4+Q2 lane must preserve the original Q2-safe decision, not import the DS4Style-v0 `iq2_s` / `iq3_s` policy. The correct bridge artifact is:
+
+- resident/root tensors copied from the validated Q4XL template
+- routed layers `0..33`: `ffn_gate_exps=IQ2_XXS`, `ffn_up_exps=IQ2_XXS`, `ffn_down_exps=Q2_K`
+- routed layers `34..39`: `ffn_gate_exps=Q4_K`, `ffn_up_exps=Q4_K`, `ffn_down_exps=Q4_K`
+
+Implementation artifacts:
+
+- policy script: `gguf-tools/qwen36/qwen36_q4_original_q2_policy.py`
+- exporter profile: `q4-original-q2` in `gguf-tools/qwen36/qwen36_v0_export_experimental.py`
+- policy json: `/tmp/qwen36_q4_original_q2_study_policy.json`
+- exported GGUF: `/mnt/e/tensors/Qwen3.6-35B-A3B-Q4-plus-original-Q2.gguf`
+- tuple probe json: `/tmp/qwen36_q4_original_q2_tuple_probe.json`
+
+Export command used the Q4XL GGUF as template, so non-routed tensors remain on the Q4XL resident contract rather than accidentally becoming Q8 resident tensors. The routed tuple probe reports:
+
+- root tensors: `token_embd.weight=Q8_0`, `output.weight=Q8_0`, `output_norm.weight=F32`
+- routed gate histogram: `IQ2_XXS:34`, `Q4_K:6`
+- routed down histogram: `Q2_K:34`, `Q4_K:6`
+- runtime path histogram: `routed_moe:40`
+- bad tuple count: `0`
+
+This is the artifact to use for the next Q4+Q2 runtime parity pass. The rejected paths are:
+
+- all-Q4 routed experiments, which discard the original Q2-safe result
+- DS4Style-v0 experiments, which introduce `IQ2_S` / `IQ3_S` and currently classify as CPU fallback in this Qwen runtime
+
+Footnote:
+
+- the Qwen study/oracle/export scripts, shell wrappers, docs, prompts, and DS4 inferred schema artifacts were migrated from ignored `misc/` into tracked `gguf-tools/qwen36/`
+- the migrated legacy files were deleted from `misc/` after syntax and smoke validation
+- the Q4 policy/export helpers have tracked copies at:
+  - `gguf-tools/qwen36/qwen36_q4_original_q2_policy.py`
+  - `gguf-tools/qwen36/qwen36_v0_export_experimental.py`
+- relocation edit for the tracked exporter:
+  - make the default `--lib` path repository-relative

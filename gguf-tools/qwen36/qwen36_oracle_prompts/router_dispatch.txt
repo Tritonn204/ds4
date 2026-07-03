@@ -1,0 +1,2 @@
+Routing note:
+The most failure-prone part of MoE inference is selecting and dispatching the top-k experts because
